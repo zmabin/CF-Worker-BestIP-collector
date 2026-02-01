@@ -1,6 +1,6 @@
-// V2.7 版本：添加定时测速（每8小时） + 手动触发测速 + 小文件带宽测试（安全优化）
-const FAST_IP_COUNT = 20; // 优质 IP 数量（减少以降低风险）
-const AUTO_TEST_MAX_IPS = 50; // 最大测试 IP 数（安全限）
+// V2.7 版本：添加定时测速 + 手动触发测速 + 小文件带宽测试（安全优化）
+const FAST_IP_COUNT = 25; // 优质 IP 数量（减少以降低风险）
+const AUTO_TEST_MAX_IPS = 70; // 最大测试 IP 数（安全限）
 const TEST_BYTES = 300000; // 测试字节数（300KB，小文件避免大流量）
 
 export default {
@@ -1432,4 +1432,5 @@ function handleCORS() {
     }
   });
 }
+
 
