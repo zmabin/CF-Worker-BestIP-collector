@@ -187,34 +187,264 @@ async function speedTestAndStore(env, ips, maxTest = 25) {
   return fastIPs;
 }
 
+// ============== ITDog 反爬验证相关函数 ==============
+
+// XOR 加密函数 (对应 Python 的 x 函数)
+function itdogXorEncrypt(inputStr, key) {
+  const fullKey = key + "PTNo2n3Ev5";
+  let output = "";
+  for (let i = 0; i < inputStr.length; i++) {
+    const charCode = inputStr.charCodeAt(i) ^ fullKey.charCodeAt(i % fullKey.length);
+    output += String.fromCharCode(charCode);
+  }
+  return output;
+}
+
+// 生成 guardret Cookie (对应 Python 的 set_ret 函数)
+function generateGuardret(guardValue) {
+  const key = guardValue.substring(0, 8);
+  const numStr = guardValue.length > 12 ? guardValue.substring(12) : "0";
+  const num = parseInt(numStr) || 0;
+  const calcValue = num * 2 + 18 - 2;
+  const encrypted = itdogXorEncrypt(String(calcValue), key);
+  // Base64 编码
+  const guardret = btoa(encrypted);
+  return guardret;
+}
+
+// 从 Set-Cookie 响应头中解析 Cookie
+function parseCookiesFromResponse(response) {
+  const cookies = {};
+  const setCookieHeaders = response.headers.getAll ? 
+    response.headers.getAll('set-cookie') : 
+    [response.headers.get('set-cookie')].filter(Boolean);
+  
+  for (const header of setCookieHeaders) {
+    if (!header) continue;
+    const parts = header.split(';')[0].split('=');
+    if (parts.length >= 2) {
+      cookies[parts[0].trim()] = parts.slice(1).join('=').trim();
+    }
+  }
+  return cookies;
+}
+
+// MD5 实现 (Cloudflare Workers 兼容)
+function md5(string) {
+  function rotateLeft(value, shift) {
+    return (value << shift) | (value >>> (32 - shift));
+  }
+  
+  function addUnsigned(x, y) {
+    const x8 = x & 0x80000000;
+    const y8 = y & 0x80000000;
+    const x4 = x & 0x40000000;
+    const y4 = y & 0x40000000;
+    const result = (x & 0x3FFFFFFF) + (y & 0x3FFFFFFF);
+    if (x4 & y4) return result ^ 0x80000000 ^ x8 ^ y8;
+    if (x4 | y4) {
+      if (result & 0x40000000) return result ^ 0xC0000000 ^ x8 ^ y8;
+      else return result ^ 0x40000000 ^ x8 ^ y8;
+    }
+    return result ^ x8 ^ y8;
+  }
+  
+  function F(x, y, z) { return (x & y) | ((~x) & z); }
+  function G(x, y, z) { return (x & z) | (y & (~z)); }
+  function H(x, y, z) { return x ^ y ^ z; }
+  function I(x, y, z) { return y ^ (x | (~z)); }
+  
+  function FF(a, b, c, d, x, s, ac) {
+    a = addUnsigned(a, addUnsigned(addUnsigned(F(b, c, d), x), ac));
+    return addUnsigned(rotateLeft(a, s), b);
+  }
+  function GG(a, b, c, d, x, s, ac) {
+    a = addUnsigned(a, addUnsigned(addUnsigned(G(b, c, d), x), ac));
+    return addUnsigned(rotateLeft(a, s), b);
+  }
+  function HH(a, b, c, d, x, s, ac) {
+    a = addUnsigned(a, addUnsigned(addUnsigned(H(b, c, d), x), ac));
+    return addUnsigned(rotateLeft(a, s), b);
+  }
+  function II(a, b, c, d, x, s, ac) {
+    a = addUnsigned(a, addUnsigned(addUnsigned(I(b, c, d), x), ac));
+    return addUnsigned(rotateLeft(a, s), b);
+  }
+  
+  function convertToWordArray(string) {
+    const lWordCount = (((string.length + 8) - ((string.length + 8) % 64)) / 64 + 1) * 16;
+    const lWordArray = Array(lWordCount - 1).fill(0);
+    let lByteCount = 0;
+    let lBytePosition = 0;
+    while (lByteCount < string.length) {
+      const lWordPosition = (lByteCount - (lByteCount % 4)) / 4;
+      lBytePosition = (lByteCount % 4) * 8;
+      lWordArray[lWordPosition] = lWordArray[lWordPosition] | (string.charCodeAt(lByteCount) << lBytePosition);
+      lByteCount++;
+    }
+    const lWordPosition = (lByteCount - (lByteCount % 4)) / 4;
+    lBytePosition = (lByteCount % 4) * 8;
+    lWordArray[lWordPosition] = lWordArray[lWordPosition] | (0x80 << lBytePosition);
+    lWordArray[lWordCount - 2] = string.length << 3;
+    lWordArray[lWordCount - 1] = string.length >>> 29;
+    return lWordArray;
+  }
+  
+  function wordToHex(value) {
+    let result = "";
+    for (let i = 0; i <= 3; i++) {
+      const byte = (value >>> (i * 8)) & 255;
+      result += ("0" + byte.toString(16)).slice(-2);
+    }
+    return result;
+  }
+  
+  const x = convertToWordArray(string);
+  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;
+  
+  const S11=7, S12=12, S13=17, S14=22, S21=5, S22=9, S23=14, S24=20;
+  const S31=4, S32=11, S33=16, S34=23, S41=6, S42=10, S43=15, S44=21;
+  
+  for (let k = 0; k < x.length; k += 16) {
+    const AA = a, BB = b, CC = c, DD = d;
+    a = FF(a,b,c,d,x[k+0],S11,0xD76AA478); d = FF(d,a,b,c,x[k+1],S12,0xE8C7B756);
+    c = FF(c,d,a,b,x[k+2],S13,0x242070DB); b = FF(b,c,d,a,x[k+3],S14,0xC1BDCEEE);
+    a = FF(a,b,c,d,x[k+4],S11,0xF57C0FAF); d = FF(d,a,b,c,x[k+5],S12,0x4787C62A);
+    c = FF(c,d,a,b,x[k+6],S13,0xA8304613); b = FF(b,c,d,a,x[k+7],S14,0xFD469501);
+    a = FF(a,b,c,d,x[k+8],S11,0x698098D8); d = FF(d,a,b,c,x[k+9],S12,0x8B44F7AF);
+    c = FF(c,d,a,b,x[k+10],S13,0xFFFF5BB1); b = FF(b,c,d,a,x[k+11],S14,0x895CD7BE);
+    a = FF(a,b,c,d,x[k+12],S11,0x6B901122); d = FF(d,a,b,c,x[k+13],S12,0xFD987193);
+    c = FF(c,d,a,b,x[k+14],S13,0xA679438E); b = FF(b,c,d,a,x[k+15],S14,0x49B40821);
+    a = GG(a,b,c,d,x[k+1],S21,0xF61E2562); d = GG(d,a,b,c,x[k+6],S22,0xC040B340);
+    c = GG(c,d,a,b,x[k+11],S23,0x265E5A51); b = GG(b,c,d,a,x[k+0],S24,0xE9B6C7AA);
+    a = GG(a,b,c,d,x[k+5],S21,0xD62F105D); d = GG(d,a,b,c,x[k+10],S22,0x2441453);
+    c = GG(c,d,a,b,x[k+15],S23,0xD8A1E681); b = GG(b,c,d,a,x[k+4],S24,0xE7D3FBC8);
+    a = GG(a,b,c,d,x[k+9],S21,0x21E1CDE6); d = GG(d,a,b,c,x[k+14],S22,0xC33707D6);
+    c = GG(c,d,a,b,x[k+3],S23,0xF4D50D87); b = GG(b,c,d,a,x[k+8],S24,0x455A14ED);
+    a = GG(a,b,c,d,x[k+13],S21,0xA9E3E905); d = GG(d,a,b,c,x[k+2],S22,0xFCEFA3F8);
+    c = GG(c,d,a,b,x[k+7],S23,0x676F02D9); b = GG(b,c,d,a,x[k+12],S24,0x8D2A4C8A);
+    a = HH(a,b,c,d,x[k+5],S31,0xFFFA3942); d = HH(d,a,b,c,x[k+8],S32,0x8771F681);
+    c = HH(c,d,a,b,x[k+11],S33,0x6D9D6122); b = HH(b,c,d,a,x[k+14],S34,0xFDE5380C);
+    a = HH(a,b,c,d,x[k+1],S31,0xA4BEEA44); d = HH(d,a,b,c,x[k+4],S32,0x4BDECFA9);
+    c = HH(c,d,a,b,x[k+7],S33,0xF6BB4B60); b = HH(b,c,d,a,x[k+10],S34,0xBEBFBC70);
+    a = HH(a,b,c,d,x[k+13],S31,0x289B7EC6); d = HH(d,a,b,c,x[k+0],S32,0xEAA127FA);
+    c = HH(c,d,a,b,x[k+3],S33,0xD4EF3085); b = HH(b,c,d,a,x[k+6],S34,0x4881D05);
+    a = HH(a,b,c,d,x[k+9],S31,0xD9D4D039); d = HH(d,a,b,c,x[k+12],S32,0xE6DB99E5);
+    c = HH(c,d,a,b,x[k+15],S33,0x1FA27CF8); b = HH(b,c,d,a,x[k+2],S34,0xC4AC5665);
+    a = II(a,b,c,d,x[k+0],S41,0xF4292244); d = II(d,a,b,c,x[k+7],S42,0x432AFF97);
+    c = II(c,d,a,b,x[k+14],S43,0xAB9423A7); b = II(b,c,d,a,x[k+5],S44,0xFC93A039);
+    a = II(a,b,c,d,x[k+12],S41,0x655B59C3); d = II(d,a,b,c,x[k+3],S42,0x8F0CCC92);
+    c = II(c,d,a,b,x[k+10],S43,0xFFEFF47D); b = II(b,c,d,a,x[k+1],S44,0x85845DD1);
+    a = II(a,b,c,d,x[k+8],S41,0x6FA87E4F); d = II(d,a,b,c,x[k+15],S42,0xFE2CE6E0);
+    c = II(c,d,a,b,x[k+6],S43,0xA3014314); b = II(b,c,d,a,x[k+13],S44,0x4E0811A1);
+    a = II(a,b,c,d,x[k+4],S41,0xF7537E82); d = II(d,a,b,c,x[k+11],S42,0xBD3AF235);
+    c = II(c,d,a,b,x[k+2],S43,0x2AD7D2BB); b = II(b,c,d,a,x[k+9],S44,0xEB86D391);
+    a = addUnsigned(a, AA); b = addUnsigned(b, BB); c = addUnsigned(c, CC); d = addUnsigned(d, DD);
+  }
+  
+  return wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d);
+}
+
+// 生成 ITDog task_token (MD5 中间16位)
+function generateTaskToken(taskId) {
+  const str = taskId + ITDOG_TOKEN;
+  const hash = md5(str);
+  // 取中间16位: [8:-8] 即 substring(8, 24)
+  return hash.substring(8, 24);
+}
+
+// ITDog 会话管理器 - 处理反爬 Cookie
+class ItdogSession {
+  constructor() {
+    this.cookies = {};
+  }
+  
+  // 获取当前 Cookie 字符串
+  getCookieString() {
+    return Object.entries(this.cookies)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+  }
+  
+  // 更新 Cookie
+  updateCookies(newCookies) {
+    Object.assign(this.cookies, newCookies);
+  }
+  
+  // 处理 guard Cookie 并生成 guardret
+  processGuardCookie() {
+    if (this.cookies.guard && !this.cookies.guardret) {
+      this.cookies.guardret = generateGuardret(this.cookies.guard);
+    }
+  }
+}
+
 // 测试单个 IP 使用 ITDog 批量 Ping
-// 通过 WebSocket 连接到 ITDog 服务器进行测速
 async function testIPWithItdog(ip, env) {
   const nodeIds = Object.keys(ITDOG_NODE_IDS).join(',');
-  const cookie = env.ITDOG_COOKIE || ITDOG_DEFAULT_COOKIE;
+  const session = new ItdogSession();
+  
+  // 如果用户提供了 Cookie，直接使用
+  const userCookie = env.ITDOG_COOKIE || ITDOG_DEFAULT_COOKIE;
+  if (userCookie) {
+    // 解析用户提供的 Cookie
+    userCookie.split(';').forEach(pair => {
+      const [key, ...val] = pair.trim().split('=');
+      if (key) session.cookies[key] = val.join('=');
+    });
+  }
+  
+  const headers = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'cache-control': 'no-cache',
+    'content-type': 'application/x-www-form-urlencoded',
+    'origin': 'https://www.itdog.cn',
+    'pragma': 'no-cache',
+    'referer': 'https://www.itdog.cn/batch_ping/',
+    'sec-ch-ua': '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+  };
   
   try {
-    // 第一步：提交测速任务获取 task_id
+    // 第一步：先访问一次获取 guard Cookie（如果还没有）
+    if (!session.cookies.guard) {
+      const initFormData = new URLSearchParams();
+      initFormData.append('host', ip);
+      initFormData.append('node_id', nodeIds);
+      initFormData.append('check_mode', 'ping');
+      
+      const initResponse = await fetch('https://www.itdog.cn/batch_ping/', {
+        method: 'POST',
+        headers: { ...headers, 'Cookie': session.getCookieString() },
+        body: initFormData.toString(),
+        signal: AbortSignal.timeout(15000)
+      });
+      
+      // 解析响应中的 Set-Cookie
+      const setCookies = parseCookiesFromResponse(initResponse);
+      session.updateCookies(setCookies);
+    }
+    
+    // 第二步：处理 guard Cookie 生成 guardret
+    session.processGuardCookie();
+    
+    // 第三步：带上 guardret 重新请求
     const formData = new URLSearchParams();
     formData.append('host', ip);
     formData.append('node_id', nodeIds);
     formData.append('check_mode', 'ping');
     
-    const headers = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Referer': 'https://www.itdog.cn/batch_ping/',
-      'Origin': 'https://www.itdog.cn'
-    };
-    
-    // 添加 Cookie 支持反爬验证
-    if (cookie) {
-      headers['Cookie'] = cookie;
-    }
-    
     const response = await fetch('https://www.itdog.cn/batch_ping/', {
       method: 'POST',
-      headers: headers,
+      headers: { ...headers, 'Cookie': session.getCookieString() },
       body: formData.toString(),
       signal: AbortSignal.timeout(15000)
     });
@@ -225,23 +455,26 @@ async function testIPWithItdog(ip, env) {
     
     const html = await response.text();
     
-    // 从响应中提取 task_id
-    const taskIdMatch = html.match(/task_id\s*[:=]\s*['"]([^'"]+)['"]/);
+    // 从响应中提取 task_id 和 wss_url
+    const taskIdMatch = html.match(/var\s+task_id\s*=\s*['"]([^'"]+)['"]/);
+    const wssUrlMatch = html.match(/var\s+wss_url\s*=\s*['"]([^'"]+)['"]/);
+    
     if (!taskIdMatch) {
-      // 检查是否需要Cookie验证
-      if (html.includes('请完成验证') || html.includes('验证码') || html.includes('请稍后')) {
-        throw new Error('ITDog需要Cookie验证，请设置ITDOG_COOKIE环境变量');
+      // 检查是否需要验证
+      if (html.includes('请完成验证') || html.includes('验证码') || html.includes('请稍后') || html.includes('访问频率')) {
+        throw new Error('ITDog反爬验证失败，请检查Cookie或稍后重试');
       }
       throw new Error('无法获取task_id');
     }
     
     const taskId = taskIdMatch[1];
+    const wssUrl = wssUrlMatch ? wssUrlMatch[1] : null;
     
-    // 生成 task_token (task_id + token 的 MD5 前16位)
-    const taskToken = await generateTaskToken(taskId);
+    // 生成 task_token (MD5 中间16位)
+    const taskToken = generateTaskToken(taskId);
     
-    // 第二步：通过轮询获取结果（模拟WebSocket效果）
-    const results = await pollItdogResults(taskId, taskToken, cookie, nodeIds.split(',').length);
+    // 通过轮询 HTTP 接口获取结果（Cloudflare Workers 不支持 WebSocket 客户端）
+    const results = await pollItdogResults(taskId, taskToken, session.getCookieString(), nodeIds.split(',').length);
     
     // 计算加权平均延迟（山东节点权重更高）
     const avgLatency = calculateWeightedLatency(results);
@@ -249,7 +482,7 @@ async function testIPWithItdog(ip, env) {
     return {
       success: true,
       latency: avgLatency,
-      bandwidth: 0, // ITDog 不提供带宽数据
+      bandwidth: 0,
       nodeResults: results
     };
     
@@ -259,80 +492,95 @@ async function testIPWithItdog(ip, env) {
   }
 }
 
-// 生成 ITDog task_token (MD5)
-async function generateTaskToken(taskId) {
-  const str = taskId + ITDOG_TOKEN;
-  const encoder = new TextEncoder();
-  const data = encoder.encode(str);
-  const hashBuffer = await crypto.subtle.digest('MD5', data).catch(() => null);
-  
-  // Cloudflare Workers 不支持 MD5，使用备用方案
-  if (!hashBuffer) {
-    // 简单的字符串哈希作为备用
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return Math.abs(hash).toString(16).padStart(16, '0').substring(0, 16);
-  }
-  
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-  return hashHex.substring(0, 16);
-}
-
 // 轮询 ITDog 结果
-async function pollItdogResults(taskId, taskToken, cookie, expectedCount) {
-  const results = [];
-  const maxRetries = 30; // 最多轮询30次
-  const pollInterval = 1000; // 每秒轮询一次
+async function pollItdogResults(taskId, taskToken, cookieString, expectedCount) {
+  const results = new Map(); // 使用 Map 去重
+  const maxRetries = 25; // 最多轮询25次
+  const pollInterval = 800; // 每800ms轮询一次
   
   const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://www.itdog.cn/batch_ping/'
+    'accept': 'application/json, text/javascript, */*; q=0.01',
+    'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'referer': 'https://www.itdog.cn/batch_ping/',
+    'sec-ch-ua': '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+    'x-requested-with': 'XMLHttpRequest'
   };
   
-  if (cookie) {
-    headers['Cookie'] = cookie;
+  if (cookieString) {
+    headers['Cookie'] = cookieString;
   }
   
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const response = await fetch(`https://www.itdog.cn/batch_ping/get_result?task_id=${taskId}&task_token=${taskToken}`, {
+      // ITDog 使用 check_data 接口获取结果
+      const response = await fetch(`https://www.itdog.cn/batch_ping/check_data?task_id=${taskId}&task_token=${taskToken}&r=${Math.random()}`, {
         headers: headers,
         signal: AbortSignal.timeout(10000)
       });
       
       if (response.ok) {
-        const data = await response.json();
+        const text = await response.text();
         
-        if (data && data.list) {
-          for (const item of data.list) {
-            if (item.result && !isNaN(parseInt(item.result))) {
-              results.push({
-                nodeId: item.node_id,
-                latency: parseInt(item.result),
-                isShandong: SHANDONG_NODE_IDS.includes(item.node_id)
+        try {
+          const data = JSON.parse(text);
+          
+          // 检查是否完成
+          if (data.type === 'finished') {
+            break;
+          }
+          
+          // 解析节点结果
+          if (data.node_id && data.time !== undefined) {
+            const latency = parseFloat(data.time);
+            if (!isNaN(latency) && latency > 0) {
+              results.set(data.node_id, {
+                nodeId: data.node_id,
+                nodeName: data.node_name || '',
+                latency: Math.round(latency),
+                isShandong: SHANDONG_NODE_IDS.includes(String(data.node_id))
               });
             }
           }
+          
+          // 处理批量数据
+          if (data.list && Array.isArray(data.list)) {
+            for (const item of data.list) {
+              if (item.node_id && item.time !== undefined) {
+                const latency = parseFloat(item.time);
+                if (!isNaN(latency) && latency > 0) {
+                  results.set(item.node_id, {
+                    nodeId: item.node_id,
+                    nodeName: item.node_name || '',
+                    latency: Math.round(latency),
+                    isShandong: SHANDONG_NODE_IDS.includes(String(item.node_id))
+                  });
+                }
+              }
+            }
+          }
+        } catch (parseErr) {
+          // 可能是其他格式的响应，忽略
         }
         
-        // 如果收到足够的结果，返回
-        if (results.length >= expectedCount * 0.7) {
+        // 如果收到足够的结果，提前退出
+        if (results.size >= expectedCount * 0.6) {
           break;
         }
       }
     } catch (e) {
-      // 忽略单次轮询错误
+      // 忽略单次轮询错误，继续下一次
     }
     
     await new Promise(resolve => setTimeout(resolve, pollInterval));
   }
   
-  return results;
+  return Array.from(results.values());
 }
 
 // 计算加权平均延迟（山东节点权重更高）
@@ -1112,24 +1360,23 @@ async function serveHTML(env, request) {
     <!-- ITDog 模态框 -->
     <div class="modal" id="itdog-modal">
         <div class="modal-content">
-            <h3>ITDog 批量 Ping 测速</h3>
-            <p>系统已集成 ITDog 批量 Ping 功能，使用国内多个监测节点进行测速。</p>
-            <p><strong>测速节点说明：</strong></p>
-            <ul style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
-                <li>已移除所有海外节点，仅使用国内节点</li>
-                <li>包含电信/联通/移动三网代表性节点</li>
-                <li>山东地区节点（青岛电信、济南联通、济南移动）权重提高30%</li>
-            </ul>
-            <p><strong>Cookie 设置：</strong></p>
-            <p style="font-size: 0.9rem; margin-bottom: 12px;">ITDog 需要 Cookie 验证。请在 Cloudflare Worker 环境变量中设置 <code style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">ITDOG_COOKIE</code></p>
-            <p><strong>获取 Cookie 方法：</strong></p>
-            <ol style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
-                <li>浏览器打开 itdog.cn 并登录</li>
-                <li>按 F12 打开开发者工具</li>
-                <li>切换到 Network 标签</li>
-                <li>访问 batch_ping 页面</li>
-                <li>复制请求头中的 Cookie 值</li>
-            </ol>
+<h3>ITDog 批量 Ping 测速</h3>
+<p>系统已集成 ITDog 批量 Ping 功能，<strong>自动处理反爬验证</strong>（guard/guardret Cookie）。</p>
+<p><strong>测速节点说明：</strong></p>
+<ul style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
+<li>已移除所有海外节点，仅使用国内节点</li>
+<li>包含电信/联通/移动三网代表性节点（北京、上海、成都、深圳等）</li>
+<li><strong style="color: #2563eb;">山东地区全部节点</strong>（青岛电信、济南联通、济南移动）</li>
+<li>山东节点延迟权重提高 <strong>30%</strong>，优先选择对山东地区友好的IP</li>
+</ul>
+<p><strong>反爬验证机制：</strong></p>
+<p style="font-size: 0.9rem; margin-bottom: 12px;">程序已内置 ITDog 的 guard Cookie 验证算法（XOR + Base64），无需手动设置 Cookie。如遇访问限制，可选设置 <code style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">ITDOG_COOKIE</code> 环境变量。</p>
+<p><strong>获取 Cookie 方法（可选）：</strong></p>
+<ol style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
+<li>浏览器打开 itdog.cn 并完成任意一次测速</li>
+<li>按 F12 打开开发者工具 - Application - Cookies</li>
+<li>复制 guard 和 guardret 的值（格式：guard=xxx; guardret=xxx）</li>
+</ol>
             <div class="modal-buttons">
                 <button class="button button-secondary" onclick="closeItdogModal()">关闭</button>
                 <button class="button" onclick="copyIPsForItdog()">复制 IP 列表</button>
