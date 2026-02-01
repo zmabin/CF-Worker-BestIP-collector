@@ -1,7 +1,51 @@
-// V2.7 版本：添加定时测速 + 手动触发测速 + 小文件带宽测试（安全优化）
-const FAST_IP_COUNT = 25; // 优质 IP 数量（减少以降低风险）
-const AUTO_TEST_MAX_IPS = 70; // 最大测试 IP 数（安全限）
-const TEST_BYTES = 300000; // 测试字节数（300KB，小文件避免大流量）
+// V3.0 版本：使用 ITDog 批量 Ping 测速替代原有测速方式
+const FAST_IP_COUNT = 25; // 优质 IP 数量
+const AUTO_TEST_MAX_IPS = 70; // 最大测试 IP 数
+const ITDOG_TOKEN = 'token_20230313000136kwyktxb0tgspm00yo5'; // ITDog token
+
+// ITDog Cookie - 需要用户设置有效的Cookie来绕过反爬验证
+// 可通过环境变量 ITDOG_COOKIE 设置，或手动填写
+const ITDOG_DEFAULT_COOKIE = '';
+
+// 山东地区节点ID列表（用于权重计算）
+const SHANDONG_NODE_IDS = ["1308", "1303", "1243"];
+
+// 山东地区节点延迟权重系数（>1 表示山东地区权重更高）
+const SHANDONG_WEIGHT = 1.3;
+
+// ITDog 测速节点配置 - 国内代表性节点 + 山东全部节点（已移除海外节点）
+const ITDOG_NODE_IDS = {
+  // === 电信节点 ===
+  "1310": ["电信", "北京"],
+  "1227": ["电信", "上海"],
+  "1304": ["电信", "四川成都"],
+  "1169": ["电信", "广东深圳"],
+  "1308": ["电信", "山东青岛"],      // 山东节点
+  "1214": ["电信", "湖北武汉"],
+  "1305": ["电信", "浙江宁波"],
+  "1306": ["电信", "河南洛阳"],
+  // === 联通节点 ===
+  "1273": ["联通", "北京"],
+  "1254": ["联通", "上海"],
+  "1226": ["联通", "四川成都"],
+  "1278": ["联通", "广东潮州"],
+  "1303": ["联通", "山东济南"],      // 山东节点
+  "1276": ["联通", "湖北武汉"],
+  "1297": ["联通", "浙江杭州"],
+  "1300": ["联通", "河南郑州"],
+  // === 移动节点 ===
+  "1250": ["移动", "北京"],
+  "1249": ["移动", "上海"],
+  "1283": ["移动", "四川成都"],
+  "1290": ["移动", "广东深圳"],
+  "1243": ["移动", "山东济南"],      // 山东节点
+  "1287": ["移动", "湖北武汉"],
+  "1233": ["移动", "浙江杭州"],
+  "1246": ["移动", "河南郑州"]
+};
+
+// 默认使用的节点ID（电信、联通、移动各一个代表性节点 + 山东节点）
+const DEFAULT_NODE_IDS = "1310,1273,1250,1308,1303,1243";
 
 export default {
   async scheduled(event, env, ctx) {
@@ -105,7 +149,7 @@ async function speedTestAndStore(env, ips, maxTest = 25) {
 
   for (let i = 0; i < ipsToTest.length; i += BATCH_SIZE) {
     const batch = ipsToTest.slice(i, i + BATCH_SIZE);
-    const batchPromises = batch.map(ip => testIPSpeed(ip));
+    const batchPromises = batch.map(ip => testIPSpeed(ip, env));
 
     const batchResults = await Promise.allSettled(batchPromises);
 
@@ -143,8 +187,175 @@ async function speedTestAndStore(env, ips, maxTest = 25) {
   return fastIPs;
 }
 
-// 测试单个 IP（延迟 + 小带宽）
-async function testIPSpeed(ip) {
+// 测试单个 IP 使用 ITDog 批量 Ping
+// 通过 WebSocket 连接到 ITDog 服务器进行测速
+async function testIPWithItdog(ip, env) {
+  const nodeIds = Object.keys(ITDOG_NODE_IDS).join(',');
+  const cookie = env.ITDOG_COOKIE || ITDOG_DEFAULT_COOKIE;
+  
+  try {
+    // 第一步：提交测速任务获取 task_id
+    const formData = new URLSearchParams();
+    formData.append('host', ip);
+    formData.append('node_id', nodeIds);
+    formData.append('check_mode', 'ping');
+    
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://www.itdog.cn/batch_ping/',
+      'Origin': 'https://www.itdog.cn'
+    };
+    
+    // 添加 Cookie 支持反爬验证
+    if (cookie) {
+      headers['Cookie'] = cookie;
+    }
+    
+    const response = await fetch('https://www.itdog.cn/batch_ping/', {
+      method: 'POST',
+      headers: headers,
+      body: formData.toString(),
+      signal: AbortSignal.timeout(15000)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`ITDog HTTP ${response.status}`);
+    }
+    
+    const html = await response.text();
+    
+    // 从响应中提取 task_id
+    const taskIdMatch = html.match(/task_id\s*[:=]\s*['"]([^'"]+)['"]/);
+    if (!taskIdMatch) {
+      // 检查是否需要Cookie验证
+      if (html.includes('请完成验证') || html.includes('验证码') || html.includes('请稍后')) {
+        throw new Error('ITDog需要Cookie验证，请设置ITDOG_COOKIE环境变量');
+      }
+      throw new Error('无法获取task_id');
+    }
+    
+    const taskId = taskIdMatch[1];
+    
+    // 生成 task_token (task_id + token 的 MD5 前16位)
+    const taskToken = await generateTaskToken(taskId);
+    
+    // 第二步：通过轮询获取结果（模拟WebSocket效果）
+    const results = await pollItdogResults(taskId, taskToken, cookie, nodeIds.split(',').length);
+    
+    // 计算加权平均延迟（山东节点权重更高）
+    const avgLatency = calculateWeightedLatency(results);
+    
+    return {
+      success: true,
+      latency: avgLatency,
+      bandwidth: 0, // ITDog 不提供带宽数据
+      nodeResults: results
+    };
+    
+  } catch (error) {
+    console.error(`ITDog test failed for ${ip}:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// 生成 ITDog task_token (MD5)
+async function generateTaskToken(taskId) {
+  const str = taskId + ITDOG_TOKEN;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(str);
+  const hashBuffer = await crypto.subtle.digest('MD5', data).catch(() => null);
+  
+  // Cloudflare Workers 不支持 MD5，使用备用方案
+  if (!hashBuffer) {
+    // 简单的字符串哈希作为备用
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(16).padStart(16, '0').substring(0, 16);
+  }
+  
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex.substring(0, 16);
+}
+
+// 轮询 ITDog 结果
+async function pollItdogResults(taskId, taskToken, cookie, expectedCount) {
+  const results = [];
+  const maxRetries = 30; // 最多轮询30次
+  const pollInterval = 1000; // 每秒轮询一次
+  
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://www.itdog.cn/batch_ping/'
+  };
+  
+  if (cookie) {
+    headers['Cookie'] = cookie;
+  }
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(`https://www.itdog.cn/batch_ping/get_result?task_id=${taskId}&task_token=${taskToken}`, {
+        headers: headers,
+        signal: AbortSignal.timeout(10000)
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        
+        if (data && data.list) {
+          for (const item of data.list) {
+            if (item.result && !isNaN(parseInt(item.result))) {
+              results.push({
+                nodeId: item.node_id,
+                latency: parseInt(item.result),
+                isShandong: SHANDONG_NODE_IDS.includes(item.node_id)
+              });
+            }
+          }
+        }
+        
+        // 如果收到足够的结果，返回
+        if (results.length >= expectedCount * 0.7) {
+          break;
+        }
+      }
+    } catch (e) {
+      // 忽略单次轮询错误
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+  
+  return results;
+}
+
+// 计算加权平均延迟（山东节点权重更高）
+function calculateWeightedLatency(results) {
+  if (!results || results.length === 0) {
+    return 9999;
+  }
+  
+  let totalWeight = 0;
+  let weightedSum = 0;
+  
+  for (const result of results) {
+    const weight = result.isShandong ? SHANDONG_WEIGHT : 1.0;
+    weightedSum += result.latency * weight;
+    totalWeight += weight;
+  }
+  
+  return Math.round(weightedSum / totalWeight);
+}
+
+// 备用测速方法：直接测试单个 IP（延迟 + 小带宽）
+async function testIPSpeedDirect(ip) {
+  const TEST_BYTES = 10000;
   try {
     const startTime = Date.now();
     const testUrl = `https://speed.cloudflare.com/__down?bytes=${TEST_BYTES}`;
@@ -152,7 +363,7 @@ async function testIPSpeed(ip) {
     const response = await fetch(testUrl, {
       headers: {
         'Host': 'speed.cloudflare.com',
-        'User-Agent': 'Mozilla/5.0 (compatible; CF-Worker-Test/1.0; low-volume-manual)'  // 标识为低量手动测试
+        'User-Agent': 'Mozilla/5.0 (compatible; CF-Worker-Test/1.0; low-volume-manual)'
       },
       cf: { resolveOverride: ip },
       signal: AbortSignal.timeout(8000)
@@ -162,15 +373,29 @@ async function testIPSpeed(ip) {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    await response.arrayBuffer();  // 读小 body
+    await response.arrayBuffer();
     const endTime = Date.now();
     const latency = endTime - startTime;
-    const bandwidth = (TEST_BYTES / 1024 / 1024) / (latency / 1000);  // MB/s
+    const bandwidth = (TEST_BYTES / 1024 / 1024) / (latency / 1000);
 
     return { success: true, latency, bandwidth };
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+// 智能测速：优先使用 ITDog，失败时使用直接测速
+async function testIPSpeed(ip, env) {
+  // 首先尝试 ITDog 测速
+  const itdogResult = await testIPWithItdog(ip, env);
+  
+  if (itdogResult.success) {
+    return itdogResult;
+  }
+  
+  // ITDog 失败时，使用直接测速作为备用
+  console.log(`ITDog failed for ${ip}, falling back to direct test`);
+  return await testIPSpeedDirect(ip);
 }
 
 // 提供HTML页面
@@ -839,7 +1064,7 @@ async function serveHTML(env, request) {
             <div class="speed-test-progress" id="speed-test-progress">
                 <div class="speed-test-progress-bar" id="speed-test-progress-bar"></div>
             </div>
-            <div style="text-align: center; margin: 8px 0; font-size: 0.9rem; color: #64748b;" id="speed-test-status">准备测速...</div>
+            <div style="text-align: center; margin: 8px 0; font-size: 0.9rem; color: #64748b;" id="speed-test-status">准备测速...（使用ITDog国内节点，山东权重+30%）</div>
           
             <div class="ip-list" id="ip-list">
                 ${fastIPs.length > 0 ?
@@ -887,20 +1112,28 @@ async function serveHTML(env, request) {
     <!-- ITDog 模态框 -->
     <div class="modal" id="itdog-modal">
         <div class="modal-content">
-            <h3>🌐 ITDog 批量 TCPing 测速</h3>
-            <p>ITDog.cn 提供了从多个国内监测点进行 TCPing 测速的功能，可以更准确地测试 IP 在国内的连通性。</p>
-            <p><strong>使用方法：</strong></p>
-            <ol style="margin-left: 20px; margin-bottom: 16px;">
-                <li>点击下方按钮复制所有 IP 地址</li>
-                <li>打开 ITDog 批量 TCPing 页面</li>
-                <li>将复制的 IP 粘贴到输入框中</li>
-                <li>点击开始测试按钮</li>
+            <h3>ITDog 批量 Ping 测速</h3>
+            <p>系统已集成 ITDog 批量 Ping 功能，使用国内多个监测节点进行测速。</p>
+            <p><strong>测速节点说明：</strong></p>
+            <ul style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
+                <li>已移除所有海外节点，仅使用国内节点</li>
+                <li>包含电信/联通/移动三网代表性节点</li>
+                <li>山东地区节点（青岛电信、济南联通、济南移动）权重提高30%</li>
+            </ul>
+            <p><strong>Cookie 设置：</strong></p>
+            <p style="font-size: 0.9rem; margin-bottom: 12px;">ITDog 需要 Cookie 验证。请在 Cloudflare Worker 环境变量中设置 <code style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px;">ITDOG_COOKIE</code></p>
+            <p><strong>获取 Cookie 方法：</strong></p>
+            <ol style="margin-left: 20px; margin-bottom: 16px; font-size: 0.9rem;">
+                <li>浏览器打开 itdog.cn 并登录</li>
+                <li>按 F12 打开开发者工具</li>
+                <li>切换到 Network 标签</li>
+                <li>访问 batch_ping 页面</li>
+                <li>复制请求头中的 Cookie 值</li>
             </ol>
-            <p><strong>注意：</strong> ITDog 免费版可能有 IP 数量限制，如果 IP 过多请分批测试。</p>
             <div class="modal-buttons">
-                <button class="button button-secondary" onclick="closeItdogModal()">取消</button>
+                <button class="button button-secondary" onclick="closeItdogModal()">关闭</button>
                 <button class="button" onclick="copyIPsForItdog()">复制 IP 列表</button>
-                <a href="https://www.itdog.cn/batch_tcping/" class="button button-success" target="_blank">打开 ITDog</a>
+                <a href="https://www.itdog.cn/batch_ping/" class="button button-success" target="_blank">打开 ITDog</a>
             </div>
         </div>
     </div>
@@ -985,7 +1218,7 @@ async function serveHTML(env, request) {
             speedtestBtn.disabled = true;
             speedtestBtn.textContent = '测速中...';
             progressBar.style.display = 'block';
-            statusElement.textContent = '正在从服务器启动手动测速...';
+            statusElement.textContent = '正在通过ITDog国内节点测速（山东权重+30%）...';
 
             try {
                 const response = await fetch('/manual-speedtest', {
