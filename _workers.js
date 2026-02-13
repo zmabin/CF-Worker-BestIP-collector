@@ -1,4 +1,6 @@
-// V2.8 版本：移除内置 Cloudflare 测速，仅保留 ITDog 批量 Ping
+// V2.9 版本：ITDog 批量 Ping 测速后生成优质 IP 列表
+
+const FAST_IP_COUNT = 25;
 
 export default {
   async scheduled(event, env, ctx) {
@@ -50,6 +52,9 @@ export default {
           return await handleGetIPs(env, request);
         case '/raw':
           return await handleRawIPs(env, request);
+        case '/fast-ips':
+        case '/fast-ips.txt':
+          return await handleGetFastIPs(env, request);
         case '/itdog-data':
           return await handleItdogData(env, request);
         case '/itdog-batch-ping':
@@ -70,6 +75,7 @@ export default {
 // 提供HTML页面
 async function serveHTML(env, request) {
   const data = await getStoredIPs(env);
+  const fastData = await getStoredFastIPs(env);
 
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -545,6 +551,10 @@ async function serveHTML(env, request) {
                     <div>IP 地址数量</div>
                 </div>
                 <div class="stat">
+                    <div class="stat-value" id="fast-ip-count">${fastData.count || 0}</div>
+                    <div>优质 IP 数量</div>
+                </div>
+                <div class="stat">
                     <div class="stat-value" id="last-updated">${data.lastUpdated ? '已更新' : '未更新'}</div>
                     <div>最后更新</div>
                 </div>
@@ -569,6 +579,14 @@ async function serveHTML(env, request) {
                 <!-- 查看按钮组 -->
                 <a href="/ip.txt" class="button button-secondary" target="_blank">
                     📋 查看IP列表
+                </a>
+
+                <!-- 优质IP按钮组 -->
+                <a href="/fast-ips.txt" class="button button-success" download="fast_ips.txt">
+                    ⚡ 下载优质IP
+                </a>
+                <a href="/fast-ips.txt" class="button button-secondary" target="_blank">
+                    📋 查看优质IP
                 </a>
 
                 <button class="button button-warning" onclick="startItdogPing()" id="itdog-btn">
@@ -801,13 +819,32 @@ async function serveHTML(env, request) {
       
         async function refreshData() {
             try {
-                const response = await fetch('/raw');
-                const data = await response.json();
+                const [rawResp, fastResp] = await Promise.all([
+                    fetch('/raw'),
+                    fetch('/itdog-batch-ping-result')
+                ]);
+                const data = await rawResp.json();
 
                 document.getElementById('ip-count').textContent = data.count || 0;
                 document.getElementById('last-updated').textContent = data.lastUpdated ? '已更新' : '未更新';
                 document.getElementById('last-time').textContent = data.lastUpdated ?
                     new Date(data.lastUpdated).toLocaleTimeString() : '从未更新';
+
+                // 更新优质 IP 数量
+                try {
+                    const fastData = await fastResp.json();
+                    if (fastData.results && fastData.results.length > 0) {
+                        // 计算有效 IP 数（有 ping 结果的）
+                        const ipMap = {};
+                        fastData.results.forEach(r => {
+                            const key = r.taskNum || r.ip;
+                            if (!ipMap[key]) ipMap[key] = { pings: [] };
+                            if (r.result >= 0) ipMap[key].pings.push(r.result);
+                        });
+                        const validCount = Math.min(Object.values(ipMap).filter(g => g.pings.length > 0).length, ${FAST_IP_COUNT});
+                        document.getElementById('fast-ip-count').textContent = validCount;
+                    }
+                } catch (e) {}
 
                 const sources = document.getElementById('sources');
                 if (data.sources && data.sources.length > 0) {
@@ -1059,7 +1096,65 @@ async function runItdogBatchPing(env, ips) {
   };
   await env.IP_STORAGE.put('itdog_ping_results', JSON.stringify(resultData));
 
+  // 根据 ITDog 结果计算并存储优质 IP
+  await computeAndStoreFastIPs(env, pingResults);
+
   return resultData;
+}
+
+// 根据 ITDog ping 结果计算优质 IP（按平均延迟从小到大，取前25个）
+async function computeAndStoreFastIPs(env, pingResults) {
+  const ipMap = {};
+  pingResults.forEach(r => {
+    const key = r.taskNum || r.ip;
+    if (!ipMap[key]) ipMap[key] = { ip: r.ip, pings: [] };
+    if (r.result >= 0) ipMap[key].pings.push(r.result);
+  });
+
+  // 计算每个 IP 的平均延迟，过滤掉全部超时的 IP
+  const ipStats = Object.values(ipMap)
+    .filter(g => g.pings.length > 0)
+    .map(g => ({
+      ip: g.ip,
+      avgLatency: Math.round(g.pings.reduce((a, b) => a + b, 0) / g.pings.length),
+      nodeCount: g.pings.length
+    }))
+    .sort((a, b) => a.avgLatency - b.avgLatency)
+    .slice(0, FAST_IP_COUNT);
+
+  await env.IP_STORAGE.put('cloudflare_fast_ips', JSON.stringify({
+    ips: ipStats,
+    lastUpdated: new Date().toISOString(),
+    count: ipStats.length
+  }));
+
+  return ipStats;
+}
+
+// 处理获取优质 IP 列表（纯文本，每行一个 IP，按延迟排序）
+async function handleGetFastIPs(env, request) {
+  try {
+    const data = await env.IP_STORAGE.get('cloudflare_fast_ips');
+    if (data) {
+      const parsed = JSON.parse(data);
+      const lines = (parsed.ips || []).map(item => item.ip);
+      return new Response(lines.join('\n'), {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Disposition': 'inline; filename="fast_ips.txt"',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+    return new Response('', {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
 }
 
 // 处理 ITDog 批量 Ping HTTP 请求
@@ -1351,6 +1446,17 @@ async function getStoredIPs(env) {
   }
 
   return getDefaultData();
+}
+// 从 KV 获取存储的优质 IPs
+async function getStoredFastIPs(env) {
+  try {
+    if (!env.IP_STORAGE) return { ips: [], count: 0, lastUpdated: null };
+    const data = await env.IP_STORAGE.get('cloudflare_fast_ips');
+    if (data) return JSON.parse(data);
+  } catch (error) {
+    console.error('Error reading fast IPs from KV:', error);
+  }
+  return { ips: [], count: 0, lastUpdated: null };
 }
 // 默认数据
 function getDefaultData() {
