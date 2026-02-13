@@ -1,7 +1,6 @@
-// V2.7 版本：添加定时测速 + 手动触发测速 + 小文件带宽测试（安全优化）
-const FAST_IP_COUNT = 25; // 优质 IP 数量（减少以降低风险）
-const AUTO_TEST_MAX_IPS = 70; // 最大测试 IP 数（安全限）
-const TEST_BYTES = 300000; // 测试字节数（300KB，小文件避免大流量）
+// V2.9 版本：ITDog 批量 Ping 测速后生成优质 IP 列表
+
+const FAST_IP_COUNT = 25;
 
 export default {
   async scheduled(event, env, ctx) {
@@ -18,8 +17,6 @@ export default {
         count: uniqueIPs.length,
         sources: results
       }));
-      // 定时自动测速
-      await speedTestAndStore(env, uniqueIPs);
       // 定时 ITDog 批量 Ping
       try {
         await runItdogBatchPing(env, uniqueIPs);
@@ -27,7 +24,7 @@ export default {
       } catch (itdogErr) {
         console.error('Scheduled ITDog batch ping failed:', itdogErr);
       }
-      console.log(`Scheduled update and test: ${uniqueIPs.length} IPs collected and tested`);
+      console.log(`Scheduled update: ${uniqueIPs.length} IPs collected`);
     } catch (error) {
       console.error('Scheduled update failed:', error);
     }
@@ -56,9 +53,8 @@ export default {
         case '/raw':
           return await handleRawIPs(env, request);
         case '/fast-ips':
-          return await handleGetFastIPs(env, request);
         case '/fast-ips.txt':
-          return await handleGetFastIPsText(env, request);
+          return await handleGetFastIPs(env, request);
         case '/itdog-data':
           return await handleItdogData(env, request);
         case '/itdog-batch-ping':
@@ -66,9 +62,6 @@ export default {
           return await handleItdogBatchPing(env, request);
         case '/itdog-batch-ping-result':
           return await handleItdogBatchPingResult(env, request);
-        case '/manual-speedtest':  // 手动测速路由
-          if (request.method !== 'POST') return jsonResponse({ error: 'POST only' }, 405);
-          return await handleManualSpeedTest(env, request);
         default:
           return jsonResponse({ error: 'Endpoint not found' }, 404);
       }
@@ -79,119 +72,11 @@ export default {
   }
 };
 
-// 处理手动测速
-async function handleManualSpeedTest(env, request) {
-  const body = await request.json();
-  const maxTest = Math.min(AUTO_TEST_MAX_IPS, body.maxTests || 25);
-
-  const data = await getStoredIPs(env);
-  const ips = data.ips || [];
-
-  if (ips.length === 0) {
-    return jsonResponse({ error: 'No IPs available' }, 400);
-  }
-
-  const startTime = Date.now();
-  const fastIPs = await speedTestAndStore(env, ips, maxTest);
-  const duration = Date.now() - startTime;
-
-  return jsonResponse({
-    success: true,
-    message: 'Manual speed test completed',
-    duration: `${duration}ms`,
-    tested: fastIPs.length,
-    fastIPs
-  });
-}
-
-// 测速并存储（用于定时和手动）
-async function speedTestAndStore(env, ips, maxTest = 25) {
-  if (!ips || ips.length === 0) return [];
-
-  const speedResults = [];
-  const BATCH_SIZE = 2; // 低并发
-  const DELAY_BETWEEN_BATCH = 1500; // ms 批次间隔
-
-  const ipsToTest = ips.slice(0, maxTest);
-  console.log(`Speed test: ${ipsToTest.length} IPs`);
-
-  for (let i = 0; i < ipsToTest.length; i += BATCH_SIZE) {
-    const batch = ipsToTest.slice(i, i + BATCH_SIZE);
-    const batchPromises = batch.map(ip => testIPSpeed(ip));
-
-    const batchResults = await Promise.allSettled(batchPromises);
-
-    for (let j = 0; j < batchResults.length; j++) {
-      const result = batchResults[j];
-      const ip = batch[j];
-      if (result.status === 'fulfilled' && result.value.success) {
-        speedResults.push({
-          ip,
-          latency: Math.round(result.value.latency),
-          bandwidth: Math.round(result.value.bandwidth)
-        });
-      }
-    }
-
-    // 批次间隔
-    if (i + BATCH_SIZE < ipsToTest.length) {
-      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCH));
-    }
-  }
-
-  // 排序：延迟升序，带宽降序
-  speedResults.sort((a, b) => a.latency - b.latency || b.bandwidth - a.bandwidth);
-  const fastIPs = speedResults.slice(0, FAST_IP_COUNT);
-
-  await env.IP_STORAGE.put('cloudflare_fast_ips', JSON.stringify({
-    fastIPs,
-    lastTested: new Date().toISOString(),
-    count: fastIPs.length,
-    testedCount: speedResults.length,
-    totalIPs: ips.length
-  }));
-
-  console.log(`Test done: ${fastIPs.length} fast IPs`);
-  return fastIPs;
-}
-
-// 测试单个 IP（延迟 + 小带宽）
-async function testIPSpeed(ip) {
-  try {
-    const startTime = Date.now();
-    const testUrl = `https://speed.cloudflare.com/__down?bytes=${TEST_BYTES}`;
-
-    const response = await fetch(testUrl, {
-      headers: {
-        'Host': 'speed.cloudflare.com',
-        'User-Agent': 'Mozilla/5.0 (compatible; CF-Worker-Test/1.0; low-volume-manual)'  // 标识为低量手动测试
-      },
-      cf: { resolveOverride: ip },
-      signal: AbortSignal.timeout(8000)
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    await response.arrayBuffer();  // 读小 body
-    const endTime = Date.now();
-    const latency = endTime - startTime;
-    const bandwidth = (TEST_BYTES / 1024 / 1024) / (latency / 1000);  // MB/s
-
-    return { success: true, latency, bandwidth };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
 // 提供HTML页面
 async function serveHTML(env, request) {
   const data = await getStoredIPs(env);
+  const fastData = await getStoredFastIPs(env);
 
-  // 获取测速后的IP数据
-  const speedData = await getStoredSpeedIPs(env);
-  const fastIPs = speedData.fastIPs || [];
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -592,43 +477,6 @@ async function serveHTML(env, request) {
             color: #64748b;
         }
       
-        /* 模态框 */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.5);
-            backdrop-filter: blur(5px);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-      
-        .modal-content {
-            background: white;
-            padding: 30px;
-            border-radius: 16px;
-            max-width: 500px;
-            width: 90%;
-            border: 1px solid #e2e8f0;
-            box-shadow: 0 20px 25px rgba(0, 0, 0, 0.1);
-        }
-      
-        .modal h3 {
-            margin-bottom: 16px;
-            color: #1e40af;
-        }
-      
-        .modal-buttons {
-            display: flex;
-            gap: 12px;
-            justify-content: flex-end;
-            margin-top: 20px;
-        }
-      
         /* 响应式设计 */
         @media (max-width: 768px) {
             .header {
@@ -682,10 +530,6 @@ async function serveHTML(env, request) {
                 width: 100%;
                 justify-content: flex-end;
             }
-          
-            .modal-buttons {
-                flex-direction: column;
-            }
         }
     </style>
 </head>
@@ -695,7 +539,7 @@ async function serveHTML(env, request) {
         <div class="header">
             <div class="header-content">
             <h1 style="text-align: center;">Cloudflare 优选IP</h1>
-            <p style="text-align: center;">自动定时拉取IP并测速</p>
+            <p style="text-align: center;">自动定时拉取IP + ITDog批量Ping</p>
             </div>
         </div>
         <!-- 系统状态卡片 -->
@@ -707,16 +551,16 @@ async function serveHTML(env, request) {
                     <div>IP 地址数量</div>
                 </div>
                 <div class="stat">
+                    <div class="stat-value" id="fast-ip-count">${fastData.count || 0}</div>
+                    <div>优质 IP 数量</div>
+                </div>
+                <div class="stat">
                     <div class="stat-value" id="last-updated">${data.lastUpdated ? '已更新' : '未更新'}</div>
                     <div>最后更新</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-value" id="last-time">${data.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : '从未更新'}</div>
+                    <div class="stat-value" id="last-time">\${data.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : '从未更新'}</div>
                     <div>更新时间</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="fast-ip-count">${fastIPs.length}</div>
-                    <div>优质 IP 数量</div>
                 </div>
             </div>
           
@@ -724,33 +568,28 @@ async function serveHTML(env, request) {
                 <button class="button" onclick="updateIPs()" id="update-btn">
                     🔄 立即更新
                 </button>
-              
+
                 <!-- 下载按钮组 -->
                 <div class="dropdown">
-                    <a href="/fast-ips.txt" class="button button-success dropdown-btn" download="cloudflare_fast_ips.txt">
-                        ⚡ 下载优质IP
-                        <span style="font-size: 0.8rem;">▼</span>
+                    <a href="/ips" class="button button-success dropdown-btn" download="cloudflare_ips.txt">
+                        📥 下载IP列表
                     </a>
-                    <div class="dropdown-content">
-                        <a href="/ips" download="cloudflare_ips.txt">📥 下载全部列表</a>
-                    </div>
                 </div>
-              
+
                 <!-- 查看按钮组 -->
-                <div class="dropdown">
-                    <a href="/fast-ips.txt" class="button button-secondary dropdown-btn" target="_blank">
-                        🔗 查看优质IP
-                        <span style="font-size: 0.8rem;">▼</span>
-                    </a>
-                    <div class="dropdown-content">
-                        <a href="/ip.txt" target="_blank">📋 查看全部文本</a>
-                    </div>
-                </div>
-              
-                <button class="button button-warning" onclick="startSpeedTest()" id="speedtest-btn">
-                    ⚡ 开始测速
-                </button>
-                <button class="button" onclick="openItdogModal()">
+                <a href="/ip.txt" class="button button-secondary" target="_blank">
+                    📋 查看IP列表
+                </a>
+
+                <!-- 优质IP按钮组 -->
+                <a href="/fast-ips.txt" class="button button-success" download="fast_ips.txt">
+                    ⚡ 下载优质IP
+                </a>
+                <a href="/fast-ips.txt" class="button button-secondary" target="_blank">
+                    📋 查看优质IP
+                </a>
+
+                <button class="button button-warning" onclick="startItdogPing()" id="itdog-btn">
                     🌐 ITDog 测速
                 </button>
                 <button class="button button-secondary" onclick="refreshData()">
@@ -764,45 +603,6 @@ async function serveHTML(env, request) {
             </div>
           
             <div class="result" id="result"></div>
-        </div>
-        <!-- 优质IP列表卡片 -->
-        <div class="card">
-            <div class="ip-list-header">
-                <h2>⚡ 优质 IP 列表</h2>
-                <div>
-                    <button class="small-btn" onclick="copyAllFastIPs()">
-                        📋 复制优质IP
-                    </button>
-                </div>
-            </div>
-          
-            <div class="speed-test-progress" id="speed-test-progress">
-                <div class="speed-test-progress-bar" id="speed-test-progress-bar"></div>
-            </div>
-            <div style="text-align: center; margin: 8px 0; font-size: 0.9rem; color: #64748b;" id="speed-test-status">准备测速...</div>
-          
-            <div class="ip-list" id="ip-list">
-                ${fastIPs.length > 0 ?
-                  fastIPs.map(item => {
-                    const ip = item.ip;
-                    const latency = item.latency;
-                    const bandwidth = item.bandwidth;
-                    const speedClass = latency < 200 ? 'speed-fast' : latency < 500 ? 'speed-medium' : 'speed-slow';
-                    return `
-                    <div class="ip-item" data-ip="${ip}">
-                        <div class="ip-info">
-                            <span class="ip-address">${ip}</span>
-                            <span class="speed-result ${speedClass}" id="speed-${ip.replace(/\./g, '-')}">${latency}ms</span>
-                            <span class="speed-result ${speedClass}" id="bandwidth-${ip.replace(/\./g, '-')}">≈ ${bandwidth} MB/s</span>
-                        </div>
-                        <div class="action-buttons">
-                            <button class="small-btn" onclick="copyIP('${ip}')">复制</button>
-                        </div>
-                    </div>
-                  `}).join('') :
-                  '<p style="text-align: center; color: #64748b; padding: 40px;">暂无优质 IP 地址数据，请点击更新按钮获取</p>'
-                }
-            </div>
         </div>
         <!-- ITDog 批量 Ping 结果卡片 -->
         <div class="card">
@@ -843,9 +643,6 @@ async function serveHTML(env, request) {
     </div>
     <script>
         // JavaScript 代码
-        let speedResults = {};
-        let isTesting = false;
-        let currentTestIndex = 0;
         async function startItdogPing() {
             const btn = document.getElementById('itdog-ping-btn');
             const progress = document.getElementById('itdog-progress');
@@ -962,91 +759,12 @@ async function serveHTML(env, request) {
             }
         }
 
-        function openItdogModal() {
-            startItdogPing();
-        }
-        function closeItdogModal() {
-            document.getElementById('itdog-modal').style.display = 'none';
-        }
         function copyIP(ip) {
             navigator.clipboard.writeText(ip).then(() => {
                 showMessage(\`已复制 IP: \${ip}\`);
             }).catch(err => {
                 showMessage('复制失败，请手动复制', 'error');
             });
-        }
-        function copyAllIPs() {
-            const ipItems = document.querySelectorAll('.ip-item span.ip-address');
-            const allIPs = Array.from(ipItems).map(span => span.textContent).join('\\n');
-          
-            if (!allIPs) {
-                showMessage('没有可复制的IP地址', 'error');
-                return;
-            }
-          
-            navigator.clipboard.writeText(allIPs).then(() => {
-                showMessage(\`已复制 \${ipItems.length} 个IP地址\`);
-            }).catch(err => {
-                showMessage('复制失败，请手动复制', 'error');
-            });
-        }
-        function copyAllFastIPs() {
-            const ipItems = document.querySelectorAll('.ip-item span.ip-address');
-            const allIPs = Array.from(ipItems).map(span => span.textContent).join('\\n');
-          
-            if (!allIPs) {
-                showMessage('没有可复制的优质IP地址', 'error');
-                return;
-            }
-          
-            navigator.clipboard.writeText(allIPs).then(() => {
-                showMessage(\`已复制 \${ipItems.length} 个优质IP地址\`);
-            }).catch(err => {
-                showMessage('复制失败，请手动复制', 'error');
-            });
-        }
-        async function startSpeedTest() {
-            if (isTesting) {
-                showMessage('测速正在进行中，请稍候...', 'error');
-                return;
-            }
-
-            isTesting = true;
-            const speedtestBtn = document.getElementById('speedtest-btn');
-            const progressBar = document.getElementById('speed-test-progress');
-            const progressBarInner = document.getElementById('speed-test-progress-bar');
-            const statusElement = document.getElementById('speed-test-status');
-
-            speedtestBtn.disabled = true;
-            speedtestBtn.textContent = '测速中...';
-            progressBar.style.display = 'block';
-            statusElement.textContent = '正在从服务器启动手动测速...';
-
-            try {
-                const response = await fetch('/manual-speedtest', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ maxTests: 25 })  // 默认 25 个，可调整
-                });
-
-                if (!response.ok) {
-                    throw new Error('测速失败');
-                }
-
-                const data = await response.json();
-                showMessage(\`测速完成！测试了 \${data.tested} 个 IP\`);
-
-                // 刷新数据
-                await refreshData();
-
-            } catch (error) {
-                showMessage('测速错误: ' + error.message, 'error');
-            } finally {
-                isTesting = false;
-                speedtestBtn.disabled = false;
-                speedtestBtn.textContent = '⚡ 开始测速';
-                progressBar.style.display = 'none';
-            }
         }
         async function updateIPs() {
             const btn = document.getElementById('update-btn');
@@ -1101,43 +819,33 @@ async function serveHTML(env, request) {
       
         async function refreshData() {
             try {
-                const response = await fetch('/raw');
-                const data = await response.json();
-              
+                const [rawResp, fastResp] = await Promise.all([
+                    fetch('/raw'),
+                    fetch('/itdog-batch-ping-result')
+                ]);
+                const data = await rawResp.json();
+
                 document.getElementById('ip-count').textContent = data.count || 0;
                 document.getElementById('last-updated').textContent = data.lastUpdated ? '已更新' : '未更新';
                 document.getElementById('last-time').textContent = data.lastUpdated ?
                     new Date(data.lastUpdated).toLocaleTimeString() : '从未更新';
-              
-                const fastResponse = await fetch('/fast-ips');
-                const fastData = await fastResponse.json();
-              
-                document.getElementById('fast-ip-count').textContent = fastData.fastIPs ? fastData.fastIPs.length : 0;
-              
-                const ipList = document.getElementById('ip-list');
-                if (fastData.fastIPs && fastData.fastIPs.length > 0) {
-                    ipList.innerHTML = fastData.fastIPs.map(item => {
-                        const ip = item.ip;
-                        const latency = item.latency;
-                        const bandwidth = item.bandwidth;
-                        const speedClass = latency < 200 ? 'speed-fast' : latency < 500 ? 'speed-medium' : 'speed-slow';
-                        return \`
-                        <div class="ip-item" data-ip="\${ip}">
-                            <div class="ip-info">
-                                <span class="ip-address">\${ip}</span>
-                                <span class="speed-result \${speedClass}" id="speed-\${ip.replace(/\./g, '-')}">\${latency}ms</span>
-                                <span class="speed-result \${speedClass}" id="bandwidth-\${ip.replace(/\./g, '-')}">≈ \${bandwidth} MB/s</span>
-                            </div>
-                            <div class="action-buttons">
-                                <button class="small-btn" onclick="copyIP('\${ip}')">复制</button>
-                            </div>
-                        </div>
-                        \`;
-                    }).join('');
-                } else {
-                    ipList.innerHTML = '<p style="text-align: center; color: #64748b; padding: 40px;">暂无优质 IP 地址数据，请点击更新按钮获取</p>';
-                }
-              
+
+                // 更新优质 IP 数量
+                try {
+                    const fastData = await fastResp.json();
+                    if (fastData.results && fastData.results.length > 0) {
+                        // 计算有效 IP 数（有 ping 结果的）
+                        const ipMap = {};
+                        fastData.results.forEach(r => {
+                            const key = r.taskNum || r.ip;
+                            if (!ipMap[key]) ipMap[key] = { pings: [] };
+                            if (r.result >= 0) ipMap[key].pings.push(r.result);
+                        });
+                        const validCount = Math.min(Object.values(ipMap).filter(g => g.pings.length > 0).length, ${FAST_IP_COUNT});
+                        document.getElementById('fast-ip-count').textContent = validCount;
+                    }
+                } catch (e) {}
+
                 const sources = document.getElementById('sources');
                 if (data.sources && data.sources.length > 0) {
                     sources.innerHTML = data.sources.map(source => \`
@@ -1200,27 +908,6 @@ async function serveHTML(env, request) {
   });
 }
 
-// 处理优质IP列表获取（JSON格式）
-async function handleGetFastIPs(env, request) {
-  const data = await getStoredSpeedIPs(env);
-  return jsonResponse(data);
-}
-// 处理优质IP列表获取（文本格式，IP#实际的延迟ms#带宽MB/s格式）
-async function handleGetFastIPsText(env, request) {
-  const data = await getStoredSpeedIPs(env);
-  const fastIPs = data.fastIPs || [];
-
-  // 格式化为 IP#实际的延迟ms#带宽MB/s
-  const ipList = fastIPs.map(item => `${item.ip}#${item.latency}ms#${item.bandwidth}MB/s`).join('\n');
-
-  return new Response(ipList, {
-    headers: {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Content-Disposition': 'inline; filename="cloudflare_fast_ips.txt"',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
 // 处理 ITDog 数据获取
 async function handleItdogData(env, request) {
   const data = await getStoredIPs(env);
@@ -1409,7 +1096,65 @@ async function runItdogBatchPing(env, ips) {
   };
   await env.IP_STORAGE.put('itdog_ping_results', JSON.stringify(resultData));
 
+  // 根据 ITDog 结果计算并存储优质 IP
+  await computeAndStoreFastIPs(env, pingResults);
+
   return resultData;
+}
+
+// 根据 ITDog ping 结果计算优质 IP（按平均延迟从小到大，取前25个）
+async function computeAndStoreFastIPs(env, pingResults) {
+  const ipMap = {};
+  pingResults.forEach(r => {
+    const key = r.taskNum || r.ip;
+    if (!ipMap[key]) ipMap[key] = { ip: r.ip, pings: [] };
+    if (r.result >= 0) ipMap[key].pings.push(r.result);
+  });
+
+  // 计算每个 IP 的平均延迟，过滤掉全部超时的 IP
+  const ipStats = Object.values(ipMap)
+    .filter(g => g.pings.length > 0)
+    .map(g => ({
+      ip: g.ip,
+      avgLatency: Math.round(g.pings.reduce((a, b) => a + b, 0) / g.pings.length),
+      nodeCount: g.pings.length
+    }))
+    .sort((a, b) => a.avgLatency - b.avgLatency)
+    .slice(0, FAST_IP_COUNT);
+
+  await env.IP_STORAGE.put('cloudflare_fast_ips', JSON.stringify({
+    ips: ipStats,
+    lastUpdated: new Date().toISOString(),
+    count: ipStats.length
+  }));
+
+  return ipStats;
+}
+
+// 处理获取优质 IP 列表（纯文本，每行一个 IP，按延迟排序）
+async function handleGetFastIPs(env, request) {
+  try {
+    const data = await env.IP_STORAGE.get('cloudflare_fast_ips');
+    if (data) {
+      const parsed = JSON.parse(data);
+      const lines = (parsed.ips || []).map(item => item.ip);
+      return new Response(lines.join('\n'), {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Disposition': 'inline; filename="fast_ips.txt"',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+    return new Response('', {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
 }
 
 // 处理 ITDog 批量 Ping HTTP 请求
@@ -1540,11 +1285,9 @@ async function handleUpdate(env, request) {
       count: uniqueIPs.length,
       sources: results
     }));
-    // 手动更新后也测速
-    await speedTestAndStore(env, uniqueIPs);
     return jsonResponse({
       success: true,
-      message: 'IPs collected and tested successfully',
+      message: 'IPs collected successfully',
       duration: `${duration}ms`,
       totalIPs: uniqueIPs.length,
       timestamp: new Date().toISOString(),
@@ -1704,23 +1447,16 @@ async function getStoredIPs(env) {
 
   return getDefaultData();
 }
-// 从 KV 获取存储的测速IPs
-async function getStoredSpeedIPs(env) {
+// 从 KV 获取存储的优质 IPs
+async function getStoredFastIPs(env) {
   try {
-    if (!env.IP_STORAGE) {
-      console.error('KV namespace IP_STORAGE is not bound');
-      return getDefaultSpeedData();
-    }
-  
+    if (!env.IP_STORAGE) return { ips: [], count: 0, lastUpdated: null };
     const data = await env.IP_STORAGE.get('cloudflare_fast_ips');
-    if (data) {
-      return JSON.parse(data);
-    }
+    if (data) return JSON.parse(data);
   } catch (error) {
-    console.error('Error reading speed IPs from KV:', error);
+    console.error('Error reading fast IPs from KV:', error);
   }
-
-  return getDefaultSpeedData();
+  return { ips: [], count: 0, lastUpdated: null };
 }
 // 默认数据
 function getDefaultData() {
@@ -1729,14 +1465,6 @@ function getDefaultData() {
     lastUpdated: null,
     count: 0,
     sources: []
-  };
-}
-// 默认测速数据
-function getDefaultSpeedData() {
-  return {
-    fastIPs: [],
-    lastTested: null,
-    count: 0
   };
 }
 // IPv4地址验证
