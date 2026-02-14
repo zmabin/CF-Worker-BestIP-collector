@@ -1,4 +1,4 @@
-// V2.10 版本：Cloudflare 原生测速生成优质 IP 列表
+// V2.11 版本：ITDog 批量 Ping 改为浏览器端执行
 
 const FAST_IP_COUNT = 25;
 
@@ -62,6 +62,9 @@ export default {
           return await handleItdogBatchPing(env, request);
         case '/itdog-batch-ping-result':
           return await handleItdogBatchPingResult(env, request);
+        case '/itdog-save-results':
+          if (request.method !== 'POST') return jsonResponse({ error: 'POST only' }, 405);
+          return await handleItdogSaveResults(env, request);
         default:
           return jsonResponse({ error: 'Endpoint not found' }, 404);
       }
@@ -645,44 +648,192 @@ async function serveHTML(env, request) {
         // JavaScript 代码
         async function startItdogPing() {
             const btn = document.getElementById('itdog-ping-btn');
-            const progress = document.getElementById('itdog-progress');
-            const progressBar = document.getElementById('itdog-progress-bar');
             const status = document.getElementById('itdog-status');
             const resultsDiv = document.getElementById('itdog-results');
-            const copyBtn = document.getElementById('itdog-copy-btn');
 
             btn.disabled = true;
-            btn.textContent = '测试中...';
-            progress.style.display = 'block';
-            progressBar.style.width = '30%';
-            status.textContent = '正在连接 ITDog 服务器并发起批量 Ping...';
-            resultsDiv.innerHTML = '<p style="text-align:center;color:#64748b;padding:20px;">正在测试，请稍候（最多约25秒）...</p>';
-            copyBtn.style.display = 'none';
+            btn.textContent = '准备中...';
+            status.textContent = '正在获取 IP 列表...';
 
             try {
-                const response = await fetch('/itdog-batch-ping', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({})
-                });
-                progressBar.style.width = '100%';
-                const data = await response.json();
-
-                if (!response.ok || !data.success) {
-                    throw new Error(data.error || '测试失败');
+                // 获取 IP 列表
+                const resp = await fetch('/itdog-data');
+                const data = await resp.json();
+                if (!data.ips || data.ips.length === 0) {
+                    throw new Error('没有可用的 IP 地址，请先点击"立即更新"收集 IP');
                 }
 
-                status.textContent = '测试完成！共 ' + data.ipCount + ' 个 IP，收到 ' + data.resultCount + ' 条结果';
-                renderItdogResults(data.results);
-                copyBtn.style.display = 'inline-flex';
+                const ips = data.ips.slice(0, 200); // ITDog 限制 200 个
+                const ipText = ips.join('\\n');
+
+                // 复制到剪贴板
+                try {
+                    await navigator.clipboard.writeText(ipText);
+                    status.textContent = '已复制 ' + ips.length + ' 个 IP 到剪贴板！';
+                } catch (e) {
+                    status.textContent = 'IP 列表复制失败，请手动从下方复制';
+                }
+
+                // 打开 ITDog 批量 Ping 页面
+                window.open('https://www.itdog.cn/batch_ping/', '_blank');
+
+                // 显示导入 UI
+                showItdogImportUI(ips.length, ipText);
             } catch (error) {
-                status.textContent = '测试失败: ' + error.message;
+                status.textContent = '失败: ' + error.message;
                 resultsDiv.innerHTML = '<p style="text-align:center;color:#ef4444;padding:20px;">' + error.message + '</p>';
             } finally {
                 btn.disabled = false;
                 btn.textContent = '🚀 开始测试';
-                setTimeout(() => { progress.style.display = 'none'; }, 2000);
             }
+        }
+
+        function showItdogImportUI(ipCount, ipText) {
+            const resultsDiv = document.getElementById('itdog-results');
+            const copyBtn = document.getElementById('itdog-copy-btn');
+            copyBtn.style.display = 'none';
+
+            resultsDiv.innerHTML = ''
+                + '<div style="padding: 20px;">'
+                + '  <h3 style="margin-bottom: 16px; color: #1e40af;">ITDog 批量 Ping 操作指南</h3>'
+                + '  <div style="background: #eff6ff; border-radius: 10px; padding: 16px; margin-bottom: 16px;">'
+                + '    <p style="margin-bottom: 8px;"><strong>步骤 1：</strong>' + ipCount + ' 个 IP 已复制到剪贴板，ITDog 页面已在新标签页打开</p>'
+                + '    <p style="margin-bottom: 8px;"><strong>步骤 2：</strong>在 ITDog 页面的输入框中粘贴 IP（Ctrl+V）</p>'
+                + '    <p style="margin-bottom: 8px;"><strong>步骤 3：</strong>选择测试节点，点击提交，等待测试完成</p>'
+                + '    <p style="margin-bottom: 0;"><strong>步骤 4：</strong>全选结果表格（Ctrl+A），复制（Ctrl+C），粘贴到下方文本框</p>'
+                + '  </div>'
+                + '  <details style="margin-bottom: 12px;">'
+                + '    <summary style="cursor: pointer; color: #64748b; font-size: 0.9rem;">如果剪贴板复制失败，点此展开 IP 列表手动复制</summary>'
+                + '    <textarea readonly style="width:100%;height:80px;margin-top:8px;font-size:0.8rem;border:1px solid #cbd5e1;border-radius:6px;padding:8px;resize:vertical;" onclick="this.select()">' + ipText + '</textarea>'
+                + '  </details>'
+                + '  <textarea id="itdog-paste-area" placeholder="将 ITDog 结果表格粘贴到这里...\\n\\n支持格式：\\n1. 直接复制 ITDog 结果表格（每行包含 IP 和延迟）\\n2. JSON 格式" style="width: 100%; height: 200px; border: 2px dashed #cbd5e1; border-radius: 10px; padding: 12px; font-size: 0.9rem; resize: vertical; font-family: monospace;"></textarea>'
+                + '  <div style="display: flex; gap: 12px; margin-top: 12px;">'
+                + '    <button class="button button-success" onclick="parseAndSaveItdogResults()" style="flex: 1;">解析并保存结果</button>'
+                + '    <button class="button button-secondary" onclick="cancelItdogImport()">取消</button>'
+                + '  </div>'
+                + '</div>';
+        }
+
+        function parseItdogPastedResults(text) {
+            text = text.trim();
+            if (!text) return [];
+
+            // 尝试 JSON 格式
+            try {
+                const json = JSON.parse(text);
+                if (Array.isArray(json)) return json;
+                if (json.results && Array.isArray(json.results)) return json.results;
+            } catch (e) {
+                // 不是 JSON，继续用正则解析
+            }
+
+            const results = [];
+            const lines = text.split('\\n');
+            const ipRe = /\\b(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\b/;
+            const latencyRe = /(\\d+)\\s*ms/i;
+            const timeoutRe = /超时|timeout|100%/i;
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                const ipMatch = trimmed.match(ipRe);
+                if (!ipMatch) continue;
+
+                const ip = ipMatch[1];
+                const latencyMatch = trimmed.match(latencyRe);
+                const isTimeout = timeoutRe.test(trimmed);
+
+                if (latencyMatch) {
+                    results.push({
+                        ip: ip,
+                        result: parseInt(latencyMatch[1]),
+                        nodeName: extractNodeName(trimmed, ip)
+                    });
+                } else if (isTimeout) {
+                    results.push({
+                        ip: ip,
+                        result: -1,
+                        nodeName: extractNodeName(trimmed, ip)
+                    });
+                } else {
+                    // 含有 IP 但无法识别延迟的行，尝试提取纯数字作为延迟
+                    const parts = trimmed.split(/[\\t,|\\s]+/);
+                    let found = false;
+                    for (const p of parts) {
+                        const n = parseInt(p);
+                        if (!isNaN(n) && n > 0 && n < 9999 && p !== ipMatch[0] && !/\\./.test(p)) {
+                            results.push({ ip: ip, result: n, nodeName: '' });
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        results.push({ ip: ip, result: -1, nodeName: '' });
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        function extractNodeName(line, ip) {
+            // 尝试提取节点名称：去除 IP、数字序号、延迟等，剩余中文+字母部分
+            let cleaned = line.replace(ip, '').replace(/\\d+\\s*ms/gi, '').replace(/超时|timeout/gi, '');
+            cleaned = cleaned.replace(/^[\\s\\d#|,\\t]+/, '').replace(/[\\s\\d#|,%\\t]+$/, '').trim();
+            // 取第一个连续中文或字母短语
+            const m = cleaned.match(/[\\u4e00-\\u9fa5a-zA-Z][\\u4e00-\\u9fa5a-zA-Z\\s\\-]*/);
+            return m ? m[0].trim() : '';
+        }
+
+        async function parseAndSaveItdogResults() {
+            const textarea = document.getElementById('itdog-paste-area');
+            const status = document.getElementById('itdog-status');
+            const resultsDiv = document.getElementById('itdog-results');
+            const copyBtn = document.getElementById('itdog-copy-btn');
+
+            if (!textarea) return;
+            const text = textarea.value;
+            if (!text.trim()) {
+                status.textContent = '请先粘贴 ITDog 结果';
+                return;
+            }
+
+            status.textContent = '正在解析结果...';
+            const results = parseItdogPastedResults(text);
+            if (results.length === 0) {
+                status.textContent = '未能解析出任何有效结果，请检查粘贴的内容格式';
+                return;
+            }
+
+            status.textContent = '已解析 ' + results.length + ' 条记录，正在保存...';
+
+            try {
+                const resp = await fetch('/itdog-save-results', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ results: results })
+                });
+                const data = await resp.json();
+
+                if (!resp.ok || !data.success) {
+                    throw new Error(data.error || '保存失败');
+                }
+
+                status.textContent = '保存成功！共 ' + data.ipCount + ' 个 IP，' + data.resultCount + ' 条结果';
+                renderItdogResults(results);
+                copyBtn.style.display = 'inline-flex';
+                // 刷新顶部统计
+                refreshData();
+            } catch (error) {
+                status.textContent = '保存失败: ' + error.message;
+            }
+        }
+
+        function cancelItdogImport() {
+            // 恢复之前的结果
+            loadItdogResults();
+            document.getElementById('itdog-status').textContent = '';
         }
 
         function renderItdogResults(results) {
@@ -1166,32 +1317,13 @@ async function handleGetFastIPs(env, request) {
   }
 }
 
-// 处理 ITDog 批量 Ping HTTP 请求
+// 处理 ITDog 批量 Ping HTTP 请求（已改为浏览器端执行）
 async function handleItdogBatchPing(env, request) {
-  try {
-    const body = await request.json();
-    let ips = body.ips;
-    if (!ips || ips.length === 0) {
-      const data = await getStoredIPs(env);
-      ips = data.ips || [];
-    }
-    if (ips.length === 0) {
-      return jsonResponse({ error: '没有可用的 IP 地址' }, 400);
-    }
-
-    const resultData = await runItdogBatchPing(env, ips);
-
-    return jsonResponse({
-      success: true,
-      message: 'ITDog 批量 Ping 完成',
-      ipCount: resultData.ipCount,
-      resultCount: resultData.nodeCount,
-      results: resultData.results
-    });
-  } catch (error) {
-    console.error('ITDog batch ping error:', error);
-    return jsonResponse({ error: error.message }, 500);
-  }
+  return jsonResponse({
+    success: false,
+    error: 'ITDog 批量 Ping 已改为浏览器端执行。请在页面上点击"开始测试"，按照指引在 ITDog 网站完成测试后将结果粘贴回来。',
+    browserOnly: true
+  });
 }
 
 // WebSocket 收集 ITDog ping 结果
@@ -1277,6 +1409,50 @@ async function handleItdogBatchPingResult(env, request) {
     return jsonResponse({ error: error.message }, 500);
   }
 }
+// 处理浏览器端提交的 ITDog 结果
+async function handleItdogSaveResults(env, request) {
+  try {
+    const body = await request.json();
+    const results = body.results;
+    if (!Array.isArray(results) || results.length === 0) {
+      return jsonResponse({ error: '无有效结果数据' }, 400);
+    }
+
+    // 验证每条结果至少包含 ip 和 result 字段
+    const validResults = results.filter(r => r.ip && typeof r.result === 'number');
+    if (validResults.length === 0) {
+      return jsonResponse({ error: '未找到包含 IP 和延迟的有效数据' }, 400);
+    }
+
+    // 提取唯一 IP 列表
+    const ipSet = new Set(validResults.map(r => r.ip));
+    const ips = Array.from(ipSet);
+
+    // 存储结果到 KV
+    const resultData = {
+      ips: ips,
+      results: validResults,
+      lastTested: new Date().toISOString(),
+      ipCount: ips.length,
+      nodeCount: validResults.length
+    };
+    await env.IP_STORAGE.put('itdog_ping_results', JSON.stringify(resultData));
+
+    // 计算并存储优质 IP
+    await computeAndStoreFastIPs(env, validResults);
+
+    return jsonResponse({
+      success: true,
+      message: 'ITDog 结果已保存',
+      ipCount: ips.length,
+      resultCount: validResults.length
+    });
+  } catch (error) {
+    console.error('Save ITDog results error:', error);
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
 // 处理手动更新
 async function handleUpdate(env, request) {
   try {
