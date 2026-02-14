@@ -1033,72 +1033,13 @@ async function runItdogBatchPing(env, ips) {
     gateway: 'last'
   }).toString();
 
-  // Step 1: GET 页面，模拟浏览器首次访问，触发 guard cookie
-  const getResp = await fetch('https://www.itdog.cn/batch_ping/', {
-    method: 'GET',
-    headers: {
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'accept-language': 'zh-CN,zh;q=0.9',
-      'user-agent': ua,
-    },
-    redirect: 'manual',
-  });
-
-  let guard = '';
-  // 从 GET 响应的 Set-Cookie 提取 guard
-  const getCookies = getResp.headers.get('set-cookie') || '';
-  for (const part of getCookies.split(/,(?=\s*\w+=)/)) {
-    const m = part.match(/guard=([^;]+)/);
-    if (m) guard = m[1];
-  }
-
-  // 如果 GET 没拿到 guard，POST 一次试试（与 Python requests.Session 行为一致）
-  if (!guard) {
-    const postResp1 = await fetch('https://www.itdog.cn/batch_ping/', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-        'referer': 'https://www.itdog.cn/batch_ping/',
-        'user-agent': ua,
-      },
-      body: formData,
-      redirect: 'manual',
-    });
-
-    const postCookies = postResp1.headers.get('set-cookie') || '';
-    for (const part of postCookies.split(/,(?=\s*\w+=)/)) {
-      const m = part.match(/guard=([^;]+)/);
-      if (m) guard = m[1];
-    }
-
-    // 如果还是没有 guard，检查响应是否已经直接包含 task_id（无反爬场景）
-    if (!guard) {
-      const body1 = await postResp1.text();
-      const wssMatch1 = body1.match(/var\s+wss_url='([^']+)'/);
-      const taskMatch1 = body1.match(/var\s+task_id='([^']+)'/);
-      if (wssMatch1 && taskMatch1) {
-        // 无需 guard，直接拿到了 task
-        return await finishItdogPing(env, ips, wssMatch1[1], taskMatch1[1]);
-      }
-
-      // 从响应体 JS 提取 guard
-      const jsMatch = body1.match(/document\.cookie\s*=\s*['"]guard=([^;'"]+)/);
-      if (jsMatch) guard = jsMatch[1];
-
-      if (!guard) {
-        // 输出所有响应头用于调试
-        const allHeaders = [];
-        postResp1.headers.forEach((v, k) => allHeaders.push(`${k}: ${v}`));
-        throw new Error('无法获取 guard cookie。状态: ' + postResp1.status
-          + '，headers: ' + allHeaders.join(' | ')
-          + '，body前300: ' + body1.substring(0, 300));
-      }
-    }
-  }
-
-  // Step 2: 计算 guardret，带 cookie 发 POST 创建任务
+  // ITDog 在 Cloudflare 后面，Worker→Cloudflare 站点不触发安全挑战，拿不到 guard cookie。
+  // 解决方案：自行生成 guard + 计算 guardret（服务端只验证数学关系，不校验签发来源）。
+  const guard = generateGuardCookie();
   const guardret = computeGuardret(guard);
-  const resp2 = await fetch('https://www.itdog.cn/batch_ping/', {
+
+  // 带 cookie 直接 POST 创建任务
+  const resp = await fetch('https://www.itdog.cn/batch_ping/', {
     method: 'POST',
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
@@ -1110,15 +1051,28 @@ async function runItdogBatchPing(env, ips) {
     body: formData,
   });
 
-  const html = await resp2.text();
+  const html = await resp.text();
   const wssMatch = html.match(/var\s+wss_url='([^']+)'/);
   const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
-    throw new Error('ITDog 任务创建失败，无法解析 wss_url/task_id。响应前300: ' + html.substring(0, 300));
+    throw new Error('ITDog 任务创建失败。响应状态: ' + resp.status + '，响应前500: ' + html.substring(0, 500));
   }
 
   return await finishItdogPing(env, ips, wssMatch[1], taskMatch[1]);
+}
+
+// 生成符合格式的 guard cookie 值
+// guard 格式: 8字符前缀 + 4字符填充 + 数字后缀（用于 guardret 计算）
+function generateGuardCookie() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let prefix = '';
+  for (let i = 0; i < 8; i++) {
+    prefix += chars[Math.floor(Math.random() * chars.length)];
+  }
+  const filler = '0000';
+  const num = Math.floor(Math.random() * 900000) + 100000; // 6位数
+  return prefix + filler + num;
 }
 
 // ITDog ping 后续处理：WebSocket 收集 + 存储结果
