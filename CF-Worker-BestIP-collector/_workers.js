@@ -1044,9 +1044,18 @@ async function runItdogBatchPing(env, ips) {
   const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
-    // 记录响应前500字符用于诊断
-    console.error('ITDog 响应内容（前500字符）:', html.substring(0, 500));
-    throw new Error('ITDog 任务创建失败。响应状态: ' + resp.status + '，响应长度: ' + html.length);
+    // 提取页面中的关键信息用于诊断
+    const titleMatch = html.match(/<title>(.*?)<\/title>/);
+    const title = titleMatch ? titleMatch[1] : '无title';
+    // 检查是否有错误提示或验证码
+    const alertMatch = html.match(/alert\(['"]([^'"]+)['"]\)/);
+    const alert = alertMatch ? alertMatch[1] : '';
+    // 截取 body 开头的文本内容
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]{0,300})/);
+    const bodySnippet = bodyMatch ? bodyMatch[1].replace(/<[^>]+>/g, '').trim().substring(0, 200) : '';
+    console.error('ITDog 响应诊断 - title:', title, 'alert:', alert, 'bodySnippet:', bodySnippet);
+    console.error('ITDog 响应内容（前1000字符）:', html.substring(0, 1000));
+    throw new Error(`ITDog 任务创建失败。状态: ${resp.status}，长度: ${html.length}，title: ${title}${alert ? '，alert: ' + alert : ''}${bodySnippet ? '，内容: ' + bodySnippet.substring(0, 100) : ''}`);
   }
 
   return await finishItdogPing(env, ips, wssMatch[1], taskMatch[1]);
