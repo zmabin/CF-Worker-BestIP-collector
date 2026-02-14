@@ -1019,9 +1019,20 @@ async function runItdogBatchPing(env, ips) {
   const resp = await fetch('https://www.itdog.cn/batch_ping/', {
     method: 'POST',
     headers: {
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+      'accept-language': 'zh-CN,zh;q=0.9',
+      'cache-control': 'max-age=0',
       'content-type': 'application/x-www-form-urlencoded',
       'origin': 'https://www.itdog.cn',
       'referer': 'https://www.itdog.cn/batch_ping/',
+      'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Microsoft Edge";v="144"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'same-origin',
+      'sec-fetch-user': '?1',
+      'upgrade-insecure-requests': '1',
       'user-agent': ua,
       'cookie': 'machine_code=false_false_',
     },
@@ -1033,7 +1044,9 @@ async function runItdogBatchPing(env, ips) {
   const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
-    throw new Error('ITDog 任务创建失败。响应状态: ' + resp.status);
+    // 记录响应前500字符用于诊断
+    console.error('ITDog 响应内容（前500字符）:', html.substring(0, 500));
+    throw new Error('ITDog 任务创建失败。响应状态: ' + resp.status + '，响应长度: ' + html.length);
   }
 
   return await finishItdogPing(env, ips, wssMatch[1], taskMatch[1]);
