@@ -1047,56 +1047,54 @@ async function runItdogBatchPing(env, ips) {
     gateway: ''
   }).toString();
 
-  // 第一次请求：获取 guard cookie（模拟 Python requests.Session 行为）
-  // 不使用 redirect: 'manual'，让 fetch 自动跟随重定向（与 Python requests 一致）
+  // 第一次请求：POST 表单数据
   const resp1 = await fetch('https://www.itdog.cn/batch_ping/', {
     method: 'POST',
     headers,
     body: formData,
   });
 
-  let guard = '';
-
-  // 方式1：从 Set-Cookie 头提取 guard
-  const setCookieHeader = resp1.headers.get('set-cookie') || '';
-  for (const part of setCookieHeader.split(/,(?=\s*\w+=)/)) {
-    const m = part.match(/guard=([^;]+)/);
-    if (m) guard = m[1];
-  }
-
-  // 方式2：从响应体的 JavaScript 中提取 guard（ITDog 可能通过 JS 设置 cookie）
   const body1 = await resp1.text();
-  if (!guard) {
-    // 匹配 document.cookie='guard=xxx' 或 document.cookie="guard=xxx"
-    const jsMatch = body1.match(/document\.cookie\s*=\s*['"]guard=([^;'"]+)/);
-    if (jsMatch) guard = jsMatch[1];
+
+  // 尝试直接从第一次响应提取 wss_url/task_id（Cloudflare Worker IP 可能不触发反爬）
+  let html = body1;
+  let wssMatch = html.match(/var\s+wss_url='([^']+)'/);
+  let taskMatch = html.match(/var\s+task_id='([^']+)'/);
+
+  // 如果第一次响应没有 wss_url/task_id，走 guard cookie 流程
+  if (!wssMatch || !taskMatch) {
+    let guard = '';
+
+    // 方式1：从 Set-Cookie 头提取 guard
+    const setCookieHeader = resp1.headers.get('set-cookie') || '';
+    for (const part of setCookieHeader.split(/,(?=\s*\w+=)/)) {
+      const m = part.match(/guard=([^;]+)/);
+      if (m) guard = m[1];
+    }
+
+    // 方式2：从响应体 JavaScript 中提取 guard
+    if (!guard) {
+      const jsMatch = body1.match(/document\.cookie\s*=\s*['"]guard=([^;'"]+)/);
+      if (jsMatch) guard = jsMatch[1];
+    }
+
+    if (!guard) {
+      throw new Error('无法获取 guard cookie 且响应中无 task_id。响应状态: ' + resp1.status + '，响应片段: ' + body1.substring(0, 500));
+    }
+
+    // 计算 guardret，带 cookie 发第二次请求
+    const guardret = computeGuardret(guard);
+    headers['cookie'] = `guard=${guard}; guardret=${guardret}`;
+    const resp2 = await fetch('https://www.itdog.cn/batch_ping/', {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+
+    html = await resp2.text();
+    wssMatch = html.match(/var\s+wss_url='([^']+)'/);
+    taskMatch = html.match(/var\s+task_id='([^']+)'/);
   }
-  if (!guard) {
-    // 匹配 guard=xxx 在 cookie 相关的 JS 代码中
-    const guardMatch = body1.match(/['"]guard['"\s]*[=:]\s*['"]([a-zA-Z0-9]+)['"]/);
-    if (guardMatch) guard = guardMatch[1];
-  }
-
-  if (!guard) {
-    throw new Error('无法获取 guard cookie。响应状态: ' + resp1.status + '，响应长度: ' + body1.length + '，响应片段: ' + body1.substring(0, 500));
-  }
-
-  // 计算 guardret
-  const guardret = computeGuardret(guard);
-
-  // 第二次请求：带 cookie 创建任务
-  headers['cookie'] = `guard=${guard}; guardret=${guardret}`;
-  const resp2 = await fetch('https://www.itdog.cn/batch_ping/', {
-    method: 'POST',
-    headers,
-    body: formData,
-  });
-
-  const html = await resp2.text();
-
-  // 提取 wss_url 和 task_id
-  const wssMatch = html.match(/var\s+wss_url='([^']+)'/);
-  const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
     throw new Error('ITDog 任务创建失败，无法解析 wss_url/task_id');
