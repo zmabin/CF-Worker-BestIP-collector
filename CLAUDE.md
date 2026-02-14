@@ -4,46 +4,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Cloudflare Workers application (V2.7) that collects Cloudflare "best IP" addresses from public sources, runs server-side speed tests, and serves results via a built-in web UI. The entire application lives in a single file: `CF-Worker-BestIP-collector/_workers.js` (~1400 lines).
+Multi-project repository for Cloudflare CDN "best IP" selection. Collects Cloudflare IP addresses from public sources, tests them via ITDog batch ping from Chinese ISP nodes, and serves results through a web UI.
+
+## Repository Structure
+
+Three independent sub-projects (each with its own `.git`):
+
+- **`CF-Worker-BestIP-collector/`** — Main Cloudflare Worker (V2.9), single file `_workers.js` (~1500 lines). Collects IPs, runs ITDog batch ping server-side, serves web UI.
+- **`itdog-batch-ping/`** — Standalone Python scripts (`itdog_ping.py`, `itdog_http.py`) for ITDog batch ping/HTTP testing. Dependencies: `requests`, `websockets`.
+- **`itdog-skill/`** — Clawdbot skill plugin wrapping ITDog client. Entry point: `scripts/itdog_client.py`. Has its own `SKILL.md` and `CLAUDE.md`.
 
 ## Development & Deployment
 
-No build tooling, package.json, or wrangler.toml is checked in. Deployment options:
+No build tooling, package.json, or wrangler.toml is checked in. No tests, linting, or CI/CD.
 
-- **Wrangler CLI**: Create a `wrangler.toml` with a KV namespace binding for `IP_STORAGE`, then `npx wrangler deploy`
+- **Deploy Worker**: Create `wrangler.toml` with KV binding `IP_STORAGE`, then `npx wrangler deploy`
 - **Local dev**: `npx wrangler dev` (requires wrangler.toml)
-- **Dashboard**: Paste `_workers.js` directly into the Cloudflare Workers editor
+- **Dashboard**: Paste `_workers.js` into Cloudflare Workers editor
+- **Python scripts**: `pip install requests websockets`, then `python itdog_ping.py` or `python itdog_http.py`
 
-There are no tests, linting, or CI/CD pipelines.
+## Worker Architecture (`_workers.js`)
 
-## Architecture
+Single-file Cloudflare Worker using module syntax (`export default { scheduled, fetch }`).
 
-Single-file Worker using Cloudflare Workers module syntax (`export default { scheduled, fetch }`).
-
-**Two entry points:**
-- `scheduled()` — Cron trigger. Calls `updateAllIPs()` to scrape IPs from 7 public sources, then `speedTestAndStore()` to test up to 25 IPs.
+**Entry points:**
+- `scheduled()` — Cron trigger. Runs `updateAllIPs()` then `runItdogBatchPing()` to collect and test IPs.
 - `fetch()` — HTTP handler. Routes via `switch` on `url.pathname`.
 
 **Key routes:**
-- `GET /` — Full inline SPA served by `serveHTML()` (lines ~177–1145)
-- `POST /update` — Manual IP collection + speed test
+- `GET /` — Inline SPA served by `serveHTML()` (lines ~76–910, entire HTML/CSS/JS as template string)
+- `POST /update` — Manual IP collection + ITDog speed test
 - `GET /ips`, `/ip.txt` — Plain text IP list
 - `GET /raw` — Raw JSON from KV
 - `GET /fast-ips`, `/fast-ips.txt` — Speed-tested results (JSON or text)
 - `GET /itdog-data` — IP list formatted for ITDog batch TCPing
-- `POST /manual-speedtest` — Server-side speed test trigger
+- `POST /itdog-batch-ping` — Trigger server-side ITDog batch ping
+- `GET /itdog-batch-ping-result` — Fetch stored ITDog ping results
 
-**IP collection** (`updateAllIPs`): Fetches from 7 hardcoded URLs in batches of 3, extracts IPv4 via regex, validates (excludes private/reserved ranges), deduplicates, sorts numerically.
+**IP collection** (`updateAllIPs`, line ~1321): Fetches from 7 hardcoded URLs in batches of 3, extracts IPv4 via regex, validates (excludes private/reserved ranges), deduplicates, sorts numerically.
 
-**Speed testing** (`speedTestAndStore`): Downloads 300KB from `speed.cloudflare.com/__down` using `cf: { resolveOverride: ip }`, batches of 2 with 1500ms delay. Results sorted by latency then bandwidth; top 25 stored as "fast IPs".
+**Speed testing** (`runItdogBatchPing`, line ~1019): V2.9 replaced the old `speedTestAndStore` (which downloaded from `speed.cloudflare.com`) with ITDog batch ping. The Worker acts as an ITDog client: bypasses anti-bot cookies (guard/guardret via XOR + `"PTNo2n3Ev5"`), creates a ping task, derives `task_token` via MD5 with salt `"token_20230313000136kwyktxb0tgspm00yo5"`, then collects results over WebSocket. Fast IPs computed by averaging ping latency across nodes, top 25 stored.
 
-**Storage**: Cloudflare KV (`env.IP_STORAGE`) with two keys: `cloudflare_ips` (all collected IPs + metadata) and `cloudflare_fast_ips` (speed test results).
+**KV keys** (namespace `IP_STORAGE`):
+- `cloudflare_ips` — All collected IPs + metadata
+- `cloudflare_fast_ips` — Top 25 IPs by average ITDog ping latency
+- `itdog_ping_results` — Raw ITDog batch ping results
 
-**Frontend**: Entire web UI is an inline HTML string inside `serveHTML()` — vanilla HTML/CSS/JS SPA that calls the Worker's own API endpoints.
+**Frontend**: Entire web UI is an inline HTML template string inside `serveHTML()` — vanilla HTML/CSS/JS SPA. UI changes require editing this large string.
 
 ## Key Considerations
 
-- V2.7 removed all authentication (admin login, API tokens) for simplicity — all endpoints are public
-- The frontend is embedded as a template string, not a separate file — UI changes require editing the large string in `serveHTML()`
-- Speed test parameters are conservative (batch size 2, 1500ms delay) to avoid Cloudflare anomaly detection
+- All endpoints are public (no authentication since V2.7)
+- ITDog anti-bot constants (`GUARD_XOR_SUFFIX`, `ITDOG_SALT`) are hardcoded and may need updating if ITDog changes them
+- ITDog limits: max 200 IPs per batch ping task
+- WebSocket collection uses 5-second per-message timeout
 - Cron trigger recommended every 5–12 hours

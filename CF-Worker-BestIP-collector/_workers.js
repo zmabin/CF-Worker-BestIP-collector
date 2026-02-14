@@ -1019,15 +1019,25 @@ const ITDOG_SALT = 'token_20230313000136kwyktxb0tgspm00yo5';
 async function runItdogBatchPing(env, ips) {
   // ITDog 限制，最多 200 个 IP
   ips = ips.slice(0, 200);
-  const ipStr = ips.join('\n');
+  const ipStr = ips.join('\r\n');
 
   const headers = {
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'accept-language': 'zh-CN,zh;q=0.9',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'cache-control': 'no-cache',
     'content-type': 'application/x-www-form-urlencoded',
     'origin': 'https://www.itdog.cn',
+    'pragma': 'no-cache',
     'referer': 'https://www.itdog.cn/batch_ping/',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'sec-ch-ua': '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
   };
 
   const formData = new URLSearchParams({
@@ -1046,15 +1056,17 @@ async function runItdogBatchPing(env, ips) {
   });
 
   let guard = '';
-  const setCookies1 = resp1.headers.getAll ? resp1.headers.getAll('set-cookie') : [resp1.headers.get('set-cookie') || ''];
-  for (const sc of setCookies1) {
-    const m = sc.match(/guard=([^;]+)/);
+  // 解析所有 Set-Cookie 头提取 guard
+  const setCookieHeader = resp1.headers.get('set-cookie') || '';
+  // Cloudflare Workers 的 headers.get('set-cookie') 会将多个 Set-Cookie 合并，用逗号分隔
+  for (const part of setCookieHeader.split(/,(?=\s*\w+=)/)) {
+    const m = part.match(/guard=([^;]+)/);
     if (m) guard = m[1];
   }
 
   if (!guard) {
     const body1 = await resp1.text();
-    throw new Error('无法获取 guard cookie，ITDog 可能已更新反爬策略');
+    throw new Error('无法获取 guard cookie，ITDog 可能已更新反爬策略。响应状态: ' + resp1.status);
   }
 
   // 计算 guardret
