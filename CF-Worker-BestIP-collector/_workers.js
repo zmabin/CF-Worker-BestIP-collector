@@ -1,4 +1,4 @@
-// V2.9 版本：ITDog 批量 Ping 测速后生成优质 IP 列表
+// V2.10 版本：Cloudflare 原生测速生成优质 IP 列表
 
 const FAST_IP_COUNT = 25;
 
@@ -17,12 +17,12 @@ export default {
         count: uniqueIPs.length,
         sources: results
       }));
-      // 定时 ITDog 批量 Ping
+      // 定时测速
       try {
-        await runItdogBatchPing(env, uniqueIPs);
-        console.log('Scheduled ITDog batch ping completed');
-      } catch (itdogErr) {
-        console.error('Scheduled ITDog batch ping failed:', itdogErr);
+        await speedTestAndStore(env, uniqueIPs);
+        console.log('Scheduled speed test completed');
+      } catch (speedErr) {
+        console.error('Scheduled speed test failed:', speedErr);
       }
       console.log(`Scheduled update: ${uniqueIPs.length} IPs collected`);
     } catch (error) {
@@ -1020,6 +1020,13 @@ const ITDOG_DEFAULT_NODES = '1310,1273,1250,1227,1254,1249,1169,1278,1290,1315,1
 
 // ITDog 批量 Ping 核心逻辑（可被 cron 和 HTTP handler 共用）
 async function runItdogBatchPing(env, ips) {
+  // 需要在 Cloudflare Worker 环境变量中设置 ITDOG_GUARD
+  // 获取方式：浏览器访问 itdog.cn → F12 → Application → Cookies → 复制 guard 的值
+  const guard = env.ITDOG_GUARD;
+  if (!guard) {
+    throw new Error('未设置 ITDOG_GUARD 环境变量。请在浏览器访问 itdog.cn，F12 打开开发者工具 → Application → Cookies → 复制 guard 的值，然后在 Worker 环境变量中设置 ITDOG_GUARD');
+  }
+
   // ITDog 限制，最多 200 个 IP
   ips = ips.slice(0, 200);
   const ipStr = ips.join('\r\n');
@@ -1033,12 +1040,9 @@ async function runItdogBatchPing(env, ips) {
     gateway: 'last'
   }).toString();
 
-  // ITDog 在 Cloudflare 后面，Worker→Cloudflare 站点不触发安全挑战，拿不到 guard cookie。
-  // 解决方案：自行生成 guard + 计算 guardret（服务端只验证数学关系，不校验签发来源）。
-  const guard = generateGuardCookie();
   const guardret = computeGuardret(guard);
 
-  // 带 cookie 直接 POST 创建任务
+  // 带 cookie POST 创建任务
   const resp = await fetch('https://www.itdog.cn/batch_ping/', {
     method: 'POST',
     headers: {
@@ -1056,23 +1060,10 @@ async function runItdogBatchPing(env, ips) {
   const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
-    throw new Error('ITDog 任务创建失败。响应状态: ' + resp.status + '，响应前500: ' + html.substring(0, 500));
+    throw new Error('ITDog 任务创建失败，guard cookie 可能已过期，请重新获取。响应状态: ' + resp.status);
   }
 
   return await finishItdogPing(env, ips, wssMatch[1], taskMatch[1]);
-}
-
-// 生成符合格式的 guard cookie 值
-// guard 格式: 8字符前缀 + 4字符填充 + 数字后缀（用于 guardret 计算）
-function generateGuardCookie() {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let prefix = '';
-  for (let i = 0; i < 8; i++) {
-    prefix += chars[Math.floor(Math.random() * chars.length)];
-  }
-  const filler = '0000';
-  const num = Math.floor(Math.random() * 900000) + 100000; // 6位数
-  return prefix + filler + num;
 }
 
 // ITDog ping 后续处理：WebSocket 收集 + 存储结果
