@@ -1008,6 +1008,46 @@ async function runItdogBatchPing(env, ips) {
 
   const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0';
 
+  const commonHeaders = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-language': 'zh-CN,zh;q=0.9',
+    'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Microsoft Edge";v="144"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'upgrade-insecure-requests': '1',
+    'user-agent': ua,
+  };
+
+  // 第一步：GET 页面，获取服务端设置的 cookie
+  const getResp = await fetch('https://www.itdog.cn/batch_ping/', {
+    method: 'GET',
+    headers: {
+      ...commonHeaders,
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      'cookie': 'machine_code=false_false_',
+    },
+    redirect: 'manual',
+  });
+  // 读取响应以完成请求
+  await getResp.text();
+
+  // 收集服务端返回的 Set-Cookie
+  let cookies = 'machine_code=false_false_';
+  const setCookieHeaders = getResp.headers.getAll ? getResp.headers.getAll('set-cookie') : [];
+  if (setCookieHeaders.length === 0) {
+    const sc = getResp.headers.get('set-cookie');
+    if (sc) setCookieHeaders.push(sc);
+  }
+  for (const sc of setCookieHeaders) {
+    const m = sc.match(/^([^=]+)=([^;]+)/);
+    if (m) cookies += `; ${m[1]}=${m[2]}`;
+  }
+  console.log('ITDog GET 状态:', getResp.status, '收集到的 cookies:', cookies);
+
+  // 第二步：POST 提交任务
   const formData = new URLSearchParams({
     host: ipStr,
     node_id: ITDOG_DEFAULT_NODES,
@@ -1015,26 +1055,19 @@ async function runItdogBatchPing(env, ips) {
     gateway: 'last'
   }).toString();
 
-  // POST 创建任务（ITDog 已取消 guard cookie，只需 machine_code）
   const resp = await fetch('https://www.itdog.cn/batch_ping/', {
     method: 'POST',
     headers: {
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-      'accept-language': 'zh-CN,zh;q=0.9',
+      ...commonHeaders,
       'cache-control': 'max-age=0',
       'content-type': 'application/x-www-form-urlencoded',
       'origin': 'https://www.itdog.cn',
       'referer': 'https://www.itdog.cn/batch_ping/',
-      'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Microsoft Edge";v="144"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
       'sec-fetch-dest': 'document',
       'sec-fetch-mode': 'navigate',
       'sec-fetch-site': 'same-origin',
       'sec-fetch-user': '?1',
-      'upgrade-insecure-requests': '1',
-      'user-agent': ua,
-      'cookie': 'machine_code=false_false_',
+      'cookie': cookies,
     },
     body: formData,
   });
@@ -1044,18 +1077,12 @@ async function runItdogBatchPing(env, ips) {
   const taskMatch = html.match(/var\s+task_id='([^']+)'/);
 
   if (!wssMatch || !taskMatch) {
-    // 提取页面中的关键信息用于诊断
     const titleMatch = html.match(/<title>(.*?)<\/title>/);
     const title = titleMatch ? titleMatch[1] : '无title';
-    // 检查是否有错误提示或验证码
     const alertMatch = html.match(/alert\(['"]([^'"]+)['"]\)/);
     const alert = alertMatch ? alertMatch[1] : '';
-    // 截取 body 开头的文本内容
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]{0,300})/);
-    const bodySnippet = bodyMatch ? bodyMatch[1].replace(/<[^>]+>/g, '').trim().substring(0, 200) : '';
-    console.error('ITDog 响应诊断 - title:', title, 'alert:', alert, 'bodySnippet:', bodySnippet);
-    console.error('ITDog 响应内容（前1000字符）:', html.substring(0, 1000));
-    throw new Error(`ITDog 任务创建失败。状态: ${resp.status}，长度: ${html.length}，title: ${title}${alert ? '，alert: ' + alert : ''}${bodySnippet ? '，内容: ' + bodySnippet.substring(0, 100) : ''}`);
+    console.error('ITDog POST 响应（前1000字符）:', html.substring(0, 1000));
+    throw new Error(`ITDog 任务创建失败。状态: ${resp.status}，长度: ${html.length}，cookies: ${cookies}，title: ${title}${alert ? '，alert: ' + alert : ''}`);
   }
 
   return await finishItdogPing(env, ips, wssMatch[1], taskMatch[1]);
